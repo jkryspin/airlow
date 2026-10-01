@@ -137,11 +137,13 @@ pub struct Timing {
     pub page_every: Duration,
     /// Pause after an error before trying again.
     pub retry_after: Duration,
+    /// Wait this long after streaming starts before opening the AirPods control channel (noise control).
+    pub aacp_delay: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { page_every: Duration::from_secs(12), retry_after: Duration::from_secs(5) }
+        Self { page_every: Duration::from_secs(12), retry_after: Duration::from_secs(5), aacp_delay: Duration::from_secs(3) }
     }
 }
 
@@ -208,17 +210,50 @@ fn cycle(h: &mut Hci, keyfile: &Path, rx: &Receiver<Cmd>, report: &dyn Fn(Status
     };
     report(Status::Connecting);
     println!("AirPods {} connected, authenticating", fmt_addr(&addr));
-    let hd = a2dp::finish_link(h, &addr, &key, hd)?;
+    let hd = match a2dp::finish_link(h, &addr, &key, hd) {
+        Ok(hd) => hd,
+        Err(e) => {
+            hangup(h, hd);
+            return Err(e);
+        }
+    };
+    let r = stream_session(h, hd, report, t, cfg);
+    crate::aacp::reset();
+    println!("stream ended: {}", r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string()));
+    // Always say goodbye. Resetting the controller instead leaves the AirPods believing the old link is alive, and
+    // they then refuse the next session's channels (hardware-verified: an endless connect/timeout/reconnect loop).
+    hangup(h, hd);
+    Ok(!live::STOP.load(Ordering::Relaxed))
+}
+
+fn stream_session(h: &mut Hci, hd: u16, report: &dyn Fn(Status), t: &Timing, cfg: &Config) -> Result<()> {
     let mut o = tone_opts(usize::MAX / 2);
     o.codec = cfg.codec;
     o.cfg.rate = live::loopback_rate()?;
     o.frames_per_packet = DEFAULT_LIVE_FRAMES_PER_PACKET;
     o.seconds = 30 * 86_400;
     let mut l = Link::new(h, hd)?;
+    l.aacp_after(t.aacp_delay);
     report(Status::Streaming);
-    let r = live::stream_live(&mut l, &o);
-    println!("stream ended: {}", r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| e.to_string()));
-    Ok(!live::STOP.load(Ordering::Relaxed))
+    live::stream_live(&mut l, &o)
+}
+
+/// HCI Disconnect (reason: remote user terminated) and wait for it to complete. Errors are ignored: the link may
+/// already be gone.
+fn hangup(h: &mut Hci, hd: u16) {
+    let mut p = hd.to_le_bytes().to_vec();
+    p.push(0x13);
+    if h.cmd(0x0406, &p).is_err() {
+        return;
+    }
+    let end = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < end {
+        if let Some(e) = h.next_event(Duration::from_millis(50)) {
+            if e[0] == 0x05 {
+                return;
+            }
+        }
+    }
 }
 
 /// Run until `Cmd::Quit`. `h` is an open controller; `keyfile` holds the pairing.

@@ -38,6 +38,10 @@ The pairing key is stored in `%APPDATA%\airlow\keys.txt`.
 4. From then on, opening the case or putting the AirPods in connects them automatically (airlow accepts their reconnect and
    pages them if they do not) and whatever Windows plays on that output is streamed to them.
 
+The tray menu also shows battery (left, right, case) and ear detection, and has a **Noise control** submenu (Off, Noise cancellation, Transparency, Adaptive). These use the AirPods' private control channel (AACP, L2CAP PSM 0x1001; protocol from the [LibrePods](https://github.com/kavishdevar/librepods) project), opened a few seconds after audio starts because opening it earlier makes the AirPods abandon the audio setup. Choosing Off also enables the AirPods' "Allow Off option" setting, which they require before they accept Off.
+
+Always end a session with a proper HCI Disconnect (the tray does, including on Quit): resetting the controller instead leaves the AirPods thinking the old link is alive, and they then refuse the next session's channels in an endless reconnect loop.
+
 Icon colour: grey = needs action, amber = waiting/connecting, green = streaming, red = error (hover or open the menu for text).
 Settings (`%APPDATA%\airlow\config.txt`, created on first use): `capture_device`, `volume` (the AirPods' initial volume, 0-127;
 Windows' own volume slider does **not** reach them because loopback is captured before it), `codec` (`sbc` or `aac`).
@@ -89,7 +93,7 @@ only for counterfeit Airoha-chip AirPods, and Apple's own macOS Game Mode works 
 * **Probe the AirPods' private AACP channel** (L2CAP PSM 0x1001, handshake and "set feature flags" packet known from LibrePods)
   for an undocumented latency capability. No one has found one; it needs a latency meter to evaluate.
 ## Testing
-A hardware-free simulation suite (85 tests) covers the whole stack against a simulated controller and a strict,
+A hardware-free simulation suite (91 tests) covers the whole stack against a simulated controller and a strict,
 AirPods-like sink; see [docs/TESTING.md](docs/TESTING.md).
 
 ## Limits

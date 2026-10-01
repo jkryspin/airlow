@@ -25,10 +25,13 @@ pub struct Link<'a> {
     volume_acked: bool,
     pub sink_delay_ms: Option<f32>,
     avdtp_txn: u8,
+    aacp_dcid: u16,
+    aacp_due: Option<Instant>,
 }
 
 const SDP_CID: u16 = 0x50;
 const AVRCP_CID: u16 = 0x42;
+const AACP_CID: u16 = 0x43;
 
 impl<'a> Link<'a> {
     pub fn new(h: &'a mut Hci, handle: u16) -> Result<Self> {
@@ -59,6 +62,8 @@ impl<'a> Link<'a> {
             volume_acked: false,
             sink_delay_ms: None,
             avdtp_txn: 8,
+            aacp_dcid: 0,
+            aacp_due: None,
         })
     }
 
@@ -331,6 +336,59 @@ impl<'a> Link<'a> {
             }
             self.other(cid, &d)?;
         }
+        if self.aacp_due.is_some_and(|t| Instant::now() >= t) {
+            self.aacp_due = None;
+            if let Err(e) = self.aacp_open() {
+                println!("AirPods control channel unavailable (noise control disabled): {e}");
+            }
+        }
+        // Only a link that has the control channel may consume a pending request.
+        if self.aacp_dcid != 0 {
+            if let Some(m) = crate::aacp::take_request() {
+                println!("  [AACP] setting noise control: {}", m.label());
+                if m == crate::aacp::NoiseMode::Off {
+                    // The AirPods ignore Off until it is allowed.
+                    self.send(self.aacp_dcid, &crate::aacp::ALLOW_OFF, false)?;
+                }
+                self.send(self.aacp_dcid, &crate::aacp::set_noise(m), false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the control channel `delay` from now, from `service()`. Opening it before the audio channels makes the
+    /// AirPods abandon the A2DP setup (hardware-verified), so it must wait until audio is flowing.
+    pub fn aacp_after(&mut self, delay: Duration) {
+        self.aacp_due = Some(Instant::now() + delay);
+    }
+
+    /// Open the AirPods' control channel (PSM 0x1001): handshake, enable features, subscribe to notifications.
+    /// Best effort: audio does not depend on it, so the caller may ignore an error.
+    pub fn aacp_open(&mut self) -> Result<()> {
+        use crate::aacp;
+        let (dcid, _) = self.open_channel(aacp::PSM, AACP_CID)?;
+        self.aacp_dcid = dcid;
+        self.send(dcid, &aacp::HANDSHAKE, false)?;
+        self.pump(Duration::from_millis(30));
+        self.send(dcid, &aacp::FEATURES, false)?;
+        self.send(dcid, &aacp::NOTIFY, false)?;
+        println!("  [AACP] control channel open");
+        Ok(()) // the initial mode report arrives later and is picked up by service()
+    }
+
+    fn aacp_rx(&mut self, d: &[u8]) -> Result<()> {
+        if let Some(m) = crate::aacp::parse_noise(d) {
+            println!("  [AACP] noise control is now {}", m.label());
+            crate::aacp::set_current(Some(m));
+        } else if let Some(p) = crate::aacp::parse_battery(d) {
+            crate::aacp::update_battery(p);
+            println!("  [AACP] {}", p.battery_text());
+        } else if let Some(e) = crate::aacp::parse_ears(d) {
+            crate::aacp::update_ears(e);
+            println!("  [AACP] ear detection {e:?}");
+        } else {
+            println!("  [AACP rx] {:02x?}", &d[..d.len().min(24)]);
+        }
         Ok(())
     }
 
@@ -341,6 +399,7 @@ impl<'a> Link<'a> {
             1 => self.sig_misc(d),
             SDP_CID => self.sdp_handle(d),
             AVRCP_CID => self.avrcp_rx(d),
+            AACP_CID => self.aacp_rx(d),
             0x40 if d.len() >= 2 && d[0] & 3 == 0 => self.avdtp_cmd(d),
             0x40 => Ok(()), // a late response nobody is waiting for
             _ => {

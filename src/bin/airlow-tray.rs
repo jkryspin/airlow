@@ -3,6 +3,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use airlow::aacp::{self, NoiseMode};
 use airlow::daemon::{self, Cmd, Status, icon_rgba};
 use airlow::live;
 use std::path::PathBuf;
@@ -10,11 +11,13 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
 
 enum Ev {
     Status(Status),
+    Noise(Option<NoiseMode>),
+    Pods(aacp::Pods),
     Menu(tray_icon::menu::MenuId),
 }
 
@@ -100,8 +103,16 @@ fn main() {
     }
 
     let status_item = MenuItem::new("Starting...", false, None);
+    let battery_item = MenuItem::new(aacp::Pods::default().battery_text(), false, None);
+    let ears_item = MenuItem::new(aacp::Pods::default().ears_text(), false, None);
     let pair_item = MenuItem::new("Pair AirPods...", true, None);
     let reconnect_item = MenuItem::new("Reconnect now", true, None);
+    let noise_menu = Submenu::new("Noise control", false);
+    let noise_items: Vec<(NoiseMode, CheckMenuItem)> =
+        NoiseMode::ALL.iter().map(|m| (*m, CheckMenuItem::new(m.label(), true, false, None))).collect();
+    for (_, item) in &noise_items {
+        let _ = noise_menu.append(item);
+    }
     let autostart_item = CheckMenuItem::new("Start with Windows", true, autostart_enabled(), None);
     let settings_item = MenuItem::new("Open settings file", true, None);
     let logs_item = MenuItem::new("Open log folder", true, None);
@@ -109,9 +120,12 @@ fn main() {
     let menu = Menu::new();
     let _ = menu.append_items(&[
         &status_item,
+        &battery_item,
+        &ears_item,
         &PredefinedMenuItem::separator(),
         &pair_item,
         &reconnect_item,
+        &noise_menu,
         &PredefinedMenuItem::separator(),
         &autostart_item,
         &settings_item,
@@ -126,6 +140,31 @@ fn main() {
         .with_icon(icon_for(&Status::Waiting))
         .build()
         .expect("tray icon");
+
+    // The AirPods report their noise control mode on the control channel; mirror it into the menu.
+    {
+        let p = proxy.clone();
+        std::thread::spawn(move || {
+            let (mut last, mut last_pods) = (None, aacp::Pods::default());
+            loop {
+                let now = aacp::current();
+                if now != last {
+                    last = now;
+                    if p.send_event(Ev::Noise(now)).is_err() {
+                        return;
+                    }
+                }
+                let pods = aacp::pods();
+                if pods != last_pods {
+                    last_pods = pods;
+                    if p.send_event(Ev::Pods(pods)).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+    }
 
     let (tx, rx) = mpsc::channel::<Cmd>();
     let worker = {
@@ -149,7 +188,23 @@ fn main() {
                 let _ = tray.set_icon(Some(icon_for(&s)));
                 let _ = tray.set_tooltip(Some(format!("airlow: {text}")));
             }
+            Ev::Pods(p) => {
+                battery_item.set_text(p.battery_text());
+                ears_item.set_text(p.ears_text());
+            }
+            Ev::Noise(mode) => {
+                noise_menu.set_enabled(mode.is_some());
+                for (m, item) in &noise_items {
+                    item.set_checked(Some(*m) == mode);
+                }
+            }
             Ev::Menu(id) => {
+                if let Some((m, item)) = noise_items.iter().find(|(_, i)| id == *i.id()) {
+                    // The check mark follows the AirPods' own confirmation, not the click.
+                    item.set_checked(aacp::current() == Some(*m));
+                    aacp::request(*m);
+                    return;
+                }
                 if id == *pair_item.id() {
                     let _ = tx.send(Cmd::Pair);
                 } else if id == *reconnect_item.id() {

@@ -21,6 +21,7 @@ const R_SDP: u16 = 0x3700; // remote-side CIDs
 const R_SIG: u16 = 0x3705;
 const R_MEDIA: u16 = 0x3706;
 const R_AVCTP: u16 = 0x3707;
+const R_AACP: u16 = 0x3708;
 
 #[derive(Clone)]
 pub struct SimConfig {
@@ -67,6 +68,10 @@ pub struct SimConfig {
     pub request_on_scan: bool,
     /// The sink hangs up this many ms after AVDTP Start (goes back in the case).
     pub drop_after_start_ms: Option<u64>,
+    /// Offer the AirPods control channel (PSM 0x1001).
+    pub aacp: bool,
+    /// Noise control mode the sink starts in (1 off, 2 ANC, 3 transparency, 4 adaptive).
+    pub aacp_mode: u8,
 }
 
 impl Default for SimConfig {
@@ -93,6 +98,8 @@ impl Default for SimConfig {
             sbc_only: false,
             request_on_scan: false,
             drop_after_start_ms: None,
+            aacp: true,
+            aacp_mode: 2,
         }
     }
 }
@@ -128,6 +135,15 @@ pub struct Report {
     pub encrypted: bool,
     /// Accept_Connection_Request was correctly answered for an incoming link.
     pub accepted_request: bool,
+    pub aacp_handshake: bool,
+    pub aacp_features: bool,
+    pub aacp_notify: bool,
+    /// Noise control modes the host commanded, in order.
+    pub aacp_sets: Vec<u8>,
+    /// The host sent the Allow Off option setting.
+    pub aacp_allow_off: bool,
+    /// The host disconnected a live link (HCI Disconnect) instead of just resetting the controller.
+    pub hangups: u32,
     pub pb_violations: u64,
     pub l2cap_config_rsp_scid_ok: bool,
     /// Times the sink's playout buffer ran dry (audible as dropouts or silence).
@@ -248,6 +264,8 @@ struct Sim {
     reasm_need: usize,
     chans: HashMap<u16, Chan>, // by remote-side cid
     n_avdtp: u8,
+    aacp_mode: u8,
+    aacp_off_allowed: bool,
     sig_id: u8,
     avdtp: AvdtpState,
     // media
@@ -283,6 +301,7 @@ fn le16(b: &[u8]) -> u16 {
 impl Sim {
     fn new(cfg: SimConfig, rep: Arc<Mutex<Report>>, etx: Sender<Vec<u8>>, atx: Sender<Vec<u8>>, rx: Receiver<Msg>) -> Self {
         let bonded = cfg.bonded_key;
+        let aacp_mode = cfg.aacp_mode;
         Self {
             cfg,
             rep,
@@ -300,6 +319,8 @@ impl Sim {
             reasm_need: 0,
             chans: HashMap::new(),
             n_avdtp: 0,
+            aacp_mode,
+            aacp_off_allowed: false,
             sig_id: 0x20,
             avdtp: AvdtpState::Idle,
             dec: sbc::Decoder::new(),
@@ -426,6 +447,18 @@ impl Sim {
                 if self.cfg.request_on_scan && p.first().map(|v| v & 2 != 0).unwrap_or(false) && !self.connected {
                     self.cfg.request_on_scan = false;
                     self.at(40, Out::Evt([vec![0x04, 10], SINK_ADDR.to_vec(), vec![0x14, 0x04, 0x20, 1]].concat()));
+                }
+            }
+            0x0406 => {
+                if p.len() == 3 && le16(p) == HANDLE && self.connected {
+                    self.cs(op, 0);
+                    self.connected = false;
+                    self.chans.clear();
+                    self.avdtp = AvdtpState::Idle;
+                    self.rep.lock().unwrap().hangups += 1;
+                    self.at(5, Out::Evt(vec![0x05, 4, 0, 0x32, 0, p[2]]));
+                } else {
+                    self.cs(op, 0x02); // no such connection
                 }
             }
             0x0409 => {
@@ -712,8 +745,51 @@ impl Sim {
             Some(0x19) if cid == R_SIG => self.avdtp_rx(p),
             Some(0x19) if cid == R_MEDIA => self.media_rx(p),
             Some(0x17) => self.avctp_rx(p),
+            Some(0x1001) => self.aacp_rx(p),
             Some(0x01) => self.sdp_rx(p),
             _ => self.err(format!("data on unknown channel {cid:#06x}")),
+        }
+    }
+
+    /// AirPods control channel: nothing works before the handshake; then features, notification subscription and
+    /// noise control commands (answered with a notification, as the real AirPods do).
+    fn aacp_rx(&mut self, p: &[u8]) {
+        let seen_hs = self.rep.lock().unwrap().aacp_handshake;
+        if p == crate::aacp::HANDSHAKE {
+            self.rep.lock().unwrap().aacp_handshake = true;
+        } else if !seen_hs {
+            self.err(format!("AACP packet before the handshake: {p:02x?}"));
+        } else if p == crate::aacp::FEATURES {
+            self.rep.lock().unwrap().aacp_features = true;
+        } else if p[..p.len().min(6)] == crate::aacp::NOTIFY[..6] && p.len() == crate::aacp::NOTIFY.len() {
+            self.rep.lock().unwrap().aacp_notify = true;
+            let n = crate::aacp::set_noise(crate::aacp::NoiseMode::from_byte(self.aacp_mode).unwrap());
+            self.remote_send(R_AACP, &n);
+            // Battery and ear detection reports as sent by the real AirPods Pro 2.
+            self.remote_send(
+                R_AACP,
+                &[
+                    0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03, 0x04, 0x01, 0x5F, 0x02, 0x01, 0x02, 0x01, 0x64, 0x01, 0x01, 0x08, 0x01, 0x32,
+                    0x02, 0x01,
+                ],
+            );
+            self.remote_send(R_AACP, &[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x01]);
+        } else if p == crate::aacp::ALLOW_OFF {
+            self.aacp_off_allowed = true;
+            self.rep.lock().unwrap().aacp_allow_off = true;
+        } else if let Some(m) = crate::aacp::parse_noise(p) {
+            if !self.rep.lock().unwrap().aacp_notify {
+                self.err("noise control command before subscribing to notifications");
+            }
+            self.rep.lock().unwrap().aacp_sets.push(m as u8);
+            // Real AirPods silently keep the old mode when asked for Off while Off is not allowed.
+            if m != crate::aacp::NoiseMode::Off || self.aacp_off_allowed {
+                self.aacp_mode = m as u8;
+            }
+            let now = crate::aacp::NoiseMode::from_byte(self.aacp_mode).unwrap();
+            self.remote_send(R_AACP, &crate::aacp::set_noise(now));
+        } else {
+            self.err(format!("unexpected AACP packet {p:02x?}"));
         }
     }
 
@@ -746,6 +822,7 @@ impl Sim {
                         }
                     }
                     0x17 => R_AVCTP,
+                    0x1001 if self.cfg.aacp => R_AACP,
                     _ => 0,
                 };
                 if local == 0 {
@@ -753,7 +830,9 @@ impl Sim {
                     r.extend_from_slice(&scid.to_le_bytes());
                     r.extend_from_slice(&[2, 0, 0, 0]);
                     self.remote_send(1, &r);
-                    self.err(format!("host opened unsupported PSM {psm:#06x}"));
+                    if psm != 0x1001 {
+                        self.err(format!("host opened unsupported PSM {psm:#06x}"));
+                    }
                     return;
                 }
                 self.chans.insert(local, Chan { local, peer: scid, psm, cfg_in: false, cfg_out: false });
@@ -2556,8 +2635,12 @@ mod tests {
         cfg: SimConfig,
         tag: &str,
         key: Option<[u8; 16]>,
-        script: impl Fn(&mpsc::Sender<Cmd>, &[Status]) -> bool,
+        mut script: impl FnMut(&mpsc::Sender<Cmd>, &[Status]) -> bool,
     ) -> (Vec<Status>, Report) {
+        // The daemon uses process-wide state (capture device, AACP mode), so daemon tests take turns.
+        static DAEMON_LOCK: Mutex<()> = Mutex::new(());
+        let _turn = DAEMON_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::aacp::set_current(None);
         let (mut h, sim) = spawn(cfg);
         let keyfile = kf(tag);
         let _ = std::fs::remove_file(&keyfile);
@@ -2568,7 +2651,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let st = statuses.clone();
         let worker = std::thread::spawn(move || {
-            let t = Timing { page_every: Duration::from_millis(300), retry_after: Duration::from_millis(200) };
+            let t = Timing {
+                page_every: Duration::from_millis(300),
+                retry_after: Duration::from_millis(200),
+                aacp_delay: Duration::from_millis(800),
+            };
             let c = Config { capture_device: String::new(), ..Config::default() };
             let report = move |s: Status| {
                 let mut g = st.lock().unwrap();
@@ -2600,7 +2687,8 @@ mod tests {
     fn daemon_accepts_the_airpods_reconnect_streams_and_goes_back_to_waiting() {
         crate::realtime_tuning();
         let key = [9u8; 16];
-        let cfg = SimConfig { request_on_scan: true, bonded_key: Some(key), drop_after_start_ms: Some(1500), ..Default::default() };
+        let cfg =
+            SimConfig { aacp: false, request_on_scan: true, bonded_key: Some(key), drop_after_start_ms: Some(1500), ..Default::default() };
         let (s, r) = run_daemon(cfg, "daemon_incoming", Some(key), |_, s| streamed_then_waiting_again(s));
         assert_eq!(s[..3], [Status::Waiting, Status::Connecting, Status::Streaming], "statuses: {s:?}");
         assert!(streamed_then_waiting_again(&s), "after the AirPods leave the daemon must wait again: {s:?}");
@@ -2613,7 +2701,7 @@ mod tests {
     fn daemon_pages_the_airpods_when_they_do_not_connect_themselves() {
         crate::realtime_tuning();
         let key = [4u8; 16];
-        let cfg = SimConfig { bonded_key: Some(key), drop_after_start_ms: Some(1000), ..Default::default() };
+        let cfg = SimConfig { aacp: false, bonded_key: Some(key), drop_after_start_ms: Some(1000), ..Default::default() };
         let (s, r) = run_daemon(cfg, "daemon_page", Some(key), |_, s| s.contains(&Status::Streaming));
         assert!(s.contains(&Status::Streaming), "statuses: {s:?}");
         assert!(r.protocol_errors.is_empty(), "protocol errors: {:?}", r.protocol_errors);
@@ -2622,7 +2710,7 @@ mod tests {
     #[test]
     fn daemon_without_a_pairing_asks_for_one_and_pairs_on_request() {
         crate::realtime_tuning();
-        let cfg = SimConfig { drop_after_start_ms: Some(1000), ..Default::default() };
+        let cfg = SimConfig { aacp: false, drop_after_start_ms: Some(1000), ..Default::default() };
         let (s, r) = run_daemon(cfg, "daemon_pair", None, |tx, s| {
             if s == [Status::NeedsPairing] {
                 tx.send(Cmd::Pair).unwrap();
@@ -2636,12 +2724,56 @@ mod tests {
     }
 
     #[test]
+    fn daemon_hangs_up_a_failed_session_instead_of_leaving_the_link_dangling() {
+        crate::realtime_tuning();
+        let key = [5u8; 16];
+        let cfg = SimConfig { aacp: false, reject_config: true, bonded_key: Some(key), ..Default::default() };
+        let (s, r) = run_daemon(cfg, "daemon_hangup", Some(key), |_, s| streamed_then_waiting_again(s));
+        assert!(streamed_then_waiting_again(&s), "statuses: {s:?}");
+        assert_eq!(r.hangups, 1, "a session that failed while the link was up must end with an HCI Disconnect");
+    }
+
+    #[test]
     fn daemon_survives_a_controller_error_and_keeps_listening() {
         crate::realtime_tuning();
         // Wrong key on the sink side: authentication fails, the daemon reports it and retries instead of dying.
-        let cfg = SimConfig { bonded_key: Some([1u8; 16]), ..Default::default() };
+        let cfg = SimConfig { aacp: false, bonded_key: Some([1u8; 16]), ..Default::default() };
         let (s, _) =
             run_daemon(cfg, "daemon_badkey", Some([2u8; 16]), |_, s| s.iter().filter(|x| matches!(x, Status::Error(_))).count() >= 1);
         assert!(s.iter().any(|x| matches!(x, Status::Error(_))), "statuses: {s:?}");
+    }
+
+    #[test]
+    fn daemon_reads_and_sets_noise_control_over_the_airpods_control_channel() {
+        use crate::aacp::{self, NoiseMode};
+        crate::realtime_tuning();
+        let key = [6u8; 16];
+        let cfg = SimConfig { aacp: true, aacp_mode: 2, bonded_key: Some(key), drop_after_start_ms: Some(6000), ..Default::default() };
+        let mut asked = false;
+        let mut asked_off = false;
+        let mut pods = aacp::Pods::default();
+        let (s, r) = run_daemon(cfg, "daemon_anc", Some(key), |_, s| {
+            if s.contains(&Status::Streaming) && aacp::current() == Some(NoiseMode::Anc) && !asked {
+                asked = true;
+                aacp::request(NoiseMode::Transparency);
+            }
+            if asked && aacp::current() == Some(NoiseMode::Transparency) && !asked_off {
+                asked_off = true;
+                aacp::request(NoiseMode::Off);
+            }
+            if aacp::current() == Some(NoiseMode::Off) {
+                pods = aacp::pods();
+            }
+            asked_off && aacp::current() == Some(NoiseMode::Off)
+        });
+        assert!(s.contains(&Status::Streaming), "statuses: {s:?}");
+        assert!(r.aacp_handshake && r.aacp_features && r.aacp_notify, "handshake, features and notification subscription required");
+        assert_eq!(r.aacp_sets, vec![3, 1], "transparency, then off");
+        assert!(r.aacp_allow_off, "Off is ignored by the AirPods unless it is allowed first");
+        assert_eq!(pods.left.map(|b| (b.percent, b.charging)), Some((95, false)));
+        assert_eq!(pods.right.map(|b| (b.percent, b.charging)), Some((100, true)));
+        assert_eq!(pods.case.map(|b| b.percent), Some(50));
+        assert_eq!(pods.ears_text(), "Ears: one in ear");
+        assert!(r.protocol_errors.is_empty(), "protocol errors: {:?}", r.protocol_errors);
     }
 }

@@ -13,7 +13,7 @@ airlow can be exercised end to end **without Bluetooth hardware**. `src/sim.rs` 
 The sink is deliberately strict: any protocol error is recorded and fails the test.
 
 ```
-cargo test --release              # ~10 s, 85 tests
+cargo test --release              # ~10 s, 91 tests
 cargo test --release -- --nocapture --test-threads=1   # see measured numbers
 airlow captest [seconds]          # no Bluetooth: checks WASAPI loopback capture on this PC
 ```

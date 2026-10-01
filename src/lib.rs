@@ -3,6 +3,7 @@
 pub mod a2dp;
 #[allow(dead_code)]
 pub mod aac;
+pub mod aacp;
 pub mod daemon;
 pub mod hci;
 pub mod latency;
