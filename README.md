@@ -47,7 +47,7 @@ much smaller. Whether it does is exactly what the A/B is for:
 set AIRLOW_CODEC=aac && airlow pair live          # AAC (AIRLOW_AAC_KBPS=96|128|160|192, default 160)
 set AIRLOW_SWEEP=codec && airlow pair live        # one session: SBC, AAC, SBC, AAC (15 s each) with audible gap markers
 ```
-If AAC helps, the follow-up is a lower-delay encoder (AAC-ELD is ~15 ms).
+The Windows encoder's delay comes from AAC-LC's 1024-sample blocks plus a block of lookahead (the transform windows overlap) and some internal buffering. The AirPods advertise only AAC-LC over A2DP (object types 0xC0), so lower-delay variants such as AAC-ELD are not available; a different LC encoder might save 20-25 ms at most.
 
 ## Testing
 A hardware-free simulation suite (73 tests) covers the whole stack against a simulated controller and a strict,
