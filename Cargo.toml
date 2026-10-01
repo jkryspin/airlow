@@ -1,0 +1,17 @@
+[package]
+name = "airlow"
+version = "0.1.0"
+edition = "2024"
+description = "Low-latency user-mode Bluetooth A2DP audio stack for Windows (WinUSB), tuned for AirPods Pro 2"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/jkryspin/airlow"
+readme = "README.md"
+keywords = ["bluetooth", "a2dp", "audio", "low-latency", "windows"]
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+rusb = "0.9.4"
+
+[build-dependencies]
+cc = "1.5.1"
