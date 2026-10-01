@@ -122,7 +122,91 @@ pub fn reconfigure_sbc(acp_seid: u8, cfg: &crate::sbc::Config) -> Vec<u8> {
     v
 }
 
+// ---------- AAC (MPEG-2,4 AAC) codec information element ----------
+
+pub const CODEC_SBC: u8 = 0x00;
+pub const CODEC_AAC: u8 = 0x02;
+pub const AAC_MPEG2_LC: u8 = 0x80;
+pub const AAC_MPEG4_LC: u8 = 0x40;
+
+/// Capabilities a sink advertises for AAC (the 6-byte codec information element).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AacCaps {
+    pub object_types: u8,
+    /// Sampling frequencies as in the element: byte 1 bits and byte 2 high nibble combined (little end = 44.1k).
+    pub freq_byte1: u8,
+    pub freq_byte2: u8,
+    pub channels: u8, // 0x08 mono, 0x04 stereo
+    pub vbr: bool,
+    pub bitrate: u32,
+}
+
+pub fn parse_aac_caps(info: &[u8]) -> Option<AacCaps> {
+    if info.len() < 6 {
+        return None;
+    }
+    Some(AacCaps {
+        object_types: info[0],
+        freq_byte1: info[1],
+        freq_byte2: info[2] & 0xF0,
+        channels: info[2] & 0x0C,
+        vbr: info[3] & 0x80 != 0,
+        bitrate: ((info[3] & 0x7F) as u32) << 16 | (info[4] as u32) << 8 | info[5] as u32,
+    })
+}
+
+/// (byte 1, byte 2 high nibble) for one sampling frequency.
+pub fn aac_freq_bits(rate: u32) -> Option<(u8, u8)> {
+    Some(match rate {
+        8000 => (0x80, 0),
+        11025 => (0x40, 0),
+        12000 => (0x20, 0),
+        16000 => (0x10, 0),
+        22050 => (0x08, 0),
+        24000 => (0x04, 0),
+        32000 => (0x02, 0),
+        44100 => (0x01, 0),
+        48000 => (0, 0x80),
+        64000 => (0, 0x40),
+        88200 => (0, 0x20),
+        96000 => (0, 0x10),
+        _ => return None,
+    })
+}
+
+/// Set_Configuration for AAC: one object type, one frequency, stereo, CBR at `bitrate`.
+pub fn set_aac_configuration(acp_seid: u8, int_seid: u8, object_type: u8, rate: u32, vbr: bool, bitrate: u32) -> Option<Vec<u8>> {
+    let (f1, f2) = aac_freq_bits(rate)?;
+    Some(vec![
+        acp_seid << 2,
+        int_seid << 2,
+        0x01,
+        0x00, // Media Transport
+        0x07,
+        0x08,
+        0x00,
+        CODEC_AAC, // Media Codec: audio, MPEG-2,4 AAC, 6 bytes of information
+        object_type,
+        f1,
+        f2 | 0x04, // stereo
+        (if vbr { 0x80 } else { 0 }) | ((bitrate >> 16) & 0x7F) as u8,
+        (bitrate >> 8) as u8,
+        bitrate as u8,
+    ])
+}
+
 // ---------- RTP / A2DP media ----------
+
+/// AAC media packet: RTP header with the marker bit set (complete LATM element) followed directly by the LATM payload.
+pub fn rtp_aac(seq: u16, timestamp: u32, ssrc: u32, latm: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(12 + latm.len());
+    v.extend_from_slice(&[0x80, 0xE0]); // V=2, M=1, PT=96
+    v.extend_from_slice(&seq.to_be_bytes());
+    v.extend_from_slice(&timestamp.to_be_bytes());
+    v.extend_from_slice(&ssrc.to_be_bytes());
+    v.extend_from_slice(latm);
+    v
+}
 
 /// One media packet carrying `nframes` whole SBC frames.
 pub fn rtp_sbc(seq: u16, timestamp: u32, ssrc: u32, nframes: u8, frames: &[u8]) -> Vec<u8> {
@@ -179,6 +263,38 @@ mod tests {
         };
         let r = reconfigure_sbc(1, &cfg);
         assert_eq!(r, [0x04, 0x07, 0x06, 0x00, 0x00, 0x22, 0x15, 35, 35]);
+    }
+
+    #[test]
+    fn aac_configuration_bytes_match_the_a2dp_layout() {
+        // MPEG-2 AAC LC, 48 kHz (byte 2 high nibble 0x8), stereo (0x4), CBR 160000 bit/s = 0x027100
+        let c = set_aac_configuration(2, 1, AAC_MPEG2_LC, 48000, false, 160_000).unwrap();
+        assert_eq!(c, [0x08, 0x04, 0x01, 0x00, 0x07, 0x08, 0x00, 0x02, 0x80, 0x00, 0x84, 0x02, 0x71, 0x00]);
+        // 44.1 kHz lives in byte 1
+        let c = set_aac_configuration(2, 1, AAC_MPEG4_LC, 44100, true, 320_000).unwrap();
+        assert_eq!(&c[8..], &[0x40, 0x01, 0x04, 0x84, 0xE2, 0x00]);
+        assert!(set_aac_configuration(2, 1, AAC_MPEG2_LC, 12345, false, 1).is_none());
+    }
+
+    #[test]
+    fn aac_caps_parse_like_the_airpods_advertise() {
+        // multiple object-type bits (as AirPods set), 44.1/48 kHz, mono+stereo, VBR, 320 kbit/s
+        let c = parse_aac_caps(&[0xC0, 0x01, 0x8C, 0x84, 0xE2, 0x00]).unwrap();
+        assert_eq!(c.object_types, 0xC0);
+        assert_eq!((c.freq_byte1, c.freq_byte2), (0x01, 0x80));
+        assert_eq!(c.channels, 0x0C);
+        assert!(c.vbr);
+        assert_eq!(c.bitrate, 320_000);
+        assert!(parse_aac_caps(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn aac_rtp_has_marker_and_no_extra_header() {
+        let p = rtp_aac(5, 1024, 9, &[0xAA, 0xBB]);
+        assert_eq!(&p[..2], &[0x80, 0xE0]);
+        assert_eq!(&p[2..4], &[0, 5]);
+        assert_eq!(&p[4..8], &1024u32.to_be_bytes());
+        assert_eq!(&p[12..], &[0xAA, 0xBB]);
     }
 
     #[test]

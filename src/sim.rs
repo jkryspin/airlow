@@ -81,7 +81,7 @@ impl Default for SimConfig {
             exists_once: false,
             garbage: false,
             max_pkts_per_sec: 0,
-            sink_prefill_ms: 60,
+            sink_prefill_ms: 120,
             reject_reconfigure: true,
         }
     }
@@ -123,6 +123,9 @@ pub struct Report {
     pub max_buffer_ms: f64,
     pub reconfigs: u64,
     pub frames_decoded: u64,
+    /// Milliseconds after Start at which each underrun happened, and the largest gap between media packets.
+    pub underrun_at_ms: Vec<u64>,
+    pub max_arrival_gap_ms: f64,
 }
 
 enum Msg {
@@ -1190,6 +1193,8 @@ impl Sim {
                     let consumed = now.duration_since(ps).as_secs_f64() * rate;
                     if consumed > self.rx_samples as f64 {
                         r.underruns += 1;
+                        let since_start = r.start_at.map(|t| now.duration_since(t).as_millis() as u64).unwrap_or(0);
+                        r.underrun_at_ms.push(since_start);
                         self.play_start = Some(now + prefill);
                         self.rx_samples = 0;
                     } else {
@@ -1219,6 +1224,9 @@ impl Sim {
         self.last_seq = Some(seq);
         self.last_ts = Some(ts);
         self.last_samples = samples;
+        if let Some(prev) = r.last_media_at {
+            r.max_arrival_gap_ms = r.max_arrival_gap_ms.max(now.duration_since(prev).as_secs_f64() * 1000.0);
+        }
         r.media_pkts += 1;
         r.first_media_at.get_or_insert(now);
         r.last_media_at = Some(now);
@@ -1391,6 +1399,8 @@ pub fn simlive(secs: u32, tone_hz: f64) -> Result<()> {
     let hd = crate::pair(&mut h, &kf)?;
     let mut l = Link::new(&mut h, hd)?;
     let o = StreamOpts {
+        codec: crate::a2dp::Codec::Sbc,
+        aac_bitrate: 160_000,
         cfg: sbc::Config {
             rate: crate::live::loopback_rate()?,
             mode: sbc::Mode::JointStereo,
@@ -1481,6 +1491,8 @@ mod tests {
 
     fn opts(seconds: u32, fpp: usize) -> StreamOpts {
         StreamOpts {
+            codec: a2dp::Codec::Sbc,
+            aac_bitrate: 160_000,
             cfg: sbc::Config { rate: sbc::Rate::Hz48000, mode: sbc::Mode::JointStereo, blocks: 8, subbands: 8, bitpool: 53, snr: false },
             frames_per_packet: fpp,
             flush_ms: 40.0,

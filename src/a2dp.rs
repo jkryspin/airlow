@@ -613,8 +613,19 @@ pub fn connect(h: &mut Hci, addr: &Addr, key: &[u8; 16]) -> Result<u16> {
     bail!("timeout connecting to {}", fmt_addr(addr))
 }
 
+/// Which audio codec to stream with. SBC is mandatory for every sink; AAC is optional and, on AirPods,
+/// reportedly uses a smaller playback buffer (at the price of ~70 ms of encoder delay on our side).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Codec {
+    Sbc,
+    Aac,
+}
+
 pub struct StreamOpts {
+    pub codec: Codec,
     pub cfg: sbc::Config,
+    /// AAC bit rate in bits/s (the Windows encoder supports 96/128/160/192 kbit/s).
+    pub aac_bitrate: u32,
     pub frames_per_packet: usize,
     pub flush_ms: f32,
     pub seconds: u32,
@@ -632,69 +643,174 @@ fn caps_has(caps: &[u8], cat: u8) -> bool {
     false
 }
 
-fn parse_sbc_caps(caps: &[u8]) -> Option<[u8; 4]> {
+/// The Media Codec capability item (category 0x07): (codec type, codec information element).
+fn media_codec_item(caps: &[u8]) -> Option<(u8, &[u8])> {
     let mut i = 0;
     while i + 2 <= caps.len() {
         let (cat, len) = (caps[i], caps[i + 1] as usize);
-        if cat == 0x07 && len >= 6 && caps[i + 3] == 0x00 {
-            return caps[i + 4..i + 8].try_into().ok();
+        if cat == 0x07 && len >= 2 && i + 2 + len <= caps.len() {
+            return Some((caps[i + 3], &caps[i + 4..i + 2 + len]));
         }
         i += 2 + len;
     }
     None
 }
 
+fn parse_sbc_caps(caps: &[u8]) -> Option<[u8; 4]> {
+    match media_codec_item(caps) {
+        Some((proto::CODEC_SBC, info)) if info.len() >= 4 => info[..4].try_into().ok(),
+        _ => None,
+    }
+}
+
+/// A stream endpoint of the sink with its advertised capabilities.
+#[derive(Clone, Debug)]
+pub struct Sep {
+    pub seid: u8,
+    pub caps: Vec<u8>,
+    /// Codec type from the Media Codec item (0x00 SBC, 0x02 AAC, 0xFF vendor), if present.
+    pub codec: Option<u8>,
+}
+
+/// Discover every free audio sink endpoint and fetch its capabilities.
+pub fn discover_seps(l: &mut Link, sig_cid: u16) -> Result<Vec<Sep>> {
+    let t = l.next_txn();
+    let d = l.avdtp(sig_cid, t, proto::AVDTP_DISCOVER, &[])?;
+    let mut seps = Vec::new();
+    for e in d.chunks(2).filter(|e| e.len() == 2 && (e[0] & 2) == 0 && (e[1] >> 4) == 0 && (e[1] >> 3) & 1 == 1) {
+        let seid = e[0] >> 2;
+        let t = l.next_txn();
+        match l.avdtp(sig_cid, t, proto::AVDTP_GET_CAPABILITIES, &[seid << 2]) {
+            Ok(caps) => {
+                let codec = media_codec_item(&caps).map(|(c, _)| c);
+                println!("sink endpoint SEID {seid}: codec {codec:02x?}, capabilities {caps:02x?}");
+                seps.push(Sep { seid, caps, codec });
+            }
+            Err(err) => println!("sink endpoint SEID {seid}: capabilities unavailable ({err})"),
+        }
+    }
+    if seps.is_empty() {
+        bail!("no free audio sink endpoint: {d:02x?}");
+    }
+    Ok(seps)
+}
+
+/// Build the Set_Configuration parameters for `sep` and the requested codec, validating against its capabilities.
+fn configuration_for(sep: &Sep, o: &StreamOpts) -> Result<Vec<u8>> {
+    let seid = sep.seid;
+    match o.codec {
+        Codec::Sbc => {
+            let sc = parse_sbc_caps(&sep.caps).ok_or_else(|| anyhow!("endpoint {seid} has no SBC: {:02x?}", sep.caps))?;
+            println!("sink SBC caps: {sc:02x?}");
+            let mut cfgp = proto::set_sbc_configuration(seid, 1, &o.cfg);
+            // AVDTP 1.3 Delay Reporting: if the sink offers it, enable it so it tells us its playout buffer depth.
+            if caps_has(&sep.caps, 0x08) {
+                cfgp.extend_from_slice(&[0x08, 0x00]);
+            }
+            // Capability sanity: refuse configs the sink did not advertise.
+            let (freq, chm, blk, sb) = (cfgp[8] & 0xF0, cfgp[8] & 0x0F, cfgp[9] & 0xF0, cfgp[9] & 0x0C);
+            if sc[0] & freq == 0 || sc[0] & chm == 0 || sc[1] & blk == 0 || sc[1] & sb == 0 {
+                bail!("sink does not support requested SBC config; caps {sc:02x?}");
+            }
+            let bp = o.cfg.bitpool.clamp(sc[2], sc[3]);
+            if bp != o.cfg.bitpool {
+                bail!("bitpool {} outside sink range {}..={}", o.cfg.bitpool, sc[2], sc[3]);
+            }
+            Ok(cfgp)
+        }
+        Codec::Aac => {
+            let (_, info) = media_codec_item(&sep.caps).ok_or_else(|| anyhow!("endpoint {seid} has no codec item"))?;
+            let c = proto::parse_aac_caps(info).ok_or_else(|| anyhow!("endpoint {seid}: unparsable AAC capabilities {info:02x?}"))?;
+            println!("sink AAC caps: {c:?}");
+            // AirPods set several object-type bits; MPEG-2 AAC-LC is the mandatory one, MPEG-4 LC the fallback.
+            let obj = if c.object_types & proto::AAC_MPEG2_LC != 0 {
+                proto::AAC_MPEG2_LC
+            } else if c.object_types & proto::AAC_MPEG4_LC != 0 {
+                proto::AAC_MPEG4_LC
+            } else {
+                bail!("sink AAC has no LC object type (bits {:#04x})", c.object_types);
+            };
+            let rate = match o.cfg.rate {
+                sbc::Rate::Hz44100 => 44100,
+                sbc::Rate::Hz48000 => 48000,
+            };
+            let (f1, f2) = proto::aac_freq_bits(rate).unwrap();
+            if c.freq_byte1 & f1 == 0 && c.freq_byte2 & f2 == 0 {
+                bail!("sink AAC does not support {rate} Hz (caps {:#04x}/{:#04x})", c.freq_byte1, c.freq_byte2);
+            }
+            if c.channels & 0x04 == 0 {
+                bail!("sink AAC does not support stereo");
+            }
+            if c.bitrate != 0 && o.aac_bitrate > c.bitrate {
+                bail!("requested AAC bit rate {} exceeds the sink's {}", o.aac_bitrate, c.bitrate);
+            }
+            proto::set_aac_configuration(seid, 1, obj, rate, false, o.aac_bitrate).ok_or_else(|| anyhow!("bad AAC configuration"))
+        }
+    }
+}
+
+/// Configure and start one endpoint: Set_Configuration, Open, media channel, volume, Start.
+/// Returns the media channel id. Everything that can block happens BEFORE Start: sinks expect media immediately after it.
+fn start_endpoint(l: &mut Link, sig_cid: u16, sep: &Sep, o: &StreamOpts, with_volume: bool) -> Result<u16> {
+    let seid = sep.seid;
+    let cfgp = configuration_for(sep, o)?;
+    let t = l.next_txn();
+    l.avdtp(sig_cid, t, proto::AVDTP_SET_CONFIGURATION, &cfgp)?;
+    let t = l.next_txn();
+    l.avdtp(sig_cid, t, proto::AVDTP_OPEN, &[seid << 2])?;
+    let (media_cid, mtu) = l.open_channel(proto::AVDTP_PSM, 0x41)?;
+    println!("media channel open (remote mtu {mtu})");
+    if with_volume {
+        if let Err(e) = l.avrcp_set_volume(0x30) {
+            println!("  [AVRCP] volume not set: {e}");
+        }
+    }
+    let t = l.next_txn();
+    l.avdtp(sig_cid, t, proto::AVDTP_START, &[seid << 2])?;
+    Ok(media_cid)
+}
+
+fn pick_sep<'a>(seps: &'a [Sep], codec: Codec) -> Result<&'a Sep> {
+    let want = match codec {
+        Codec::Sbc => proto::CODEC_SBC,
+        Codec::Aac => proto::CODEC_AAC,
+    };
+    seps.iter().find(|s| s.codec == Some(want)).ok_or_else(|| {
+        let have: Vec<String> = seps.iter().map(|s| format!("SEID {} codec {:02x?}", s.seid, s.codec)).collect();
+        anyhow!("the sink offers no {codec:?} endpoint (it offers: {})", have.join("; "))
+    })
+}
+
 /// Full A2DP bring-up. Returns (signalling cid, sink seid, media cid) with the stream started.
 pub fn open_stream(l: &mut Link, o: &StreamOpts) -> Result<(u16, u8, u16)> {
     // Auto-flush: drop audio the radio could not deliver in time instead of retransmitting.
     if o.flush_ms > 0.0 {
-        let slots = (o.flush_ms / 0.625) as u16;
-        let mut p = l.handle.to_le_bytes().to_vec();
-        p.extend_from_slice(&slots.to_le_bytes());
-        l.h.cmd(0x0C28, &p)?;
+        l.set_flush_ms(o.flush_ms)?;
         println!("ACL auto-flush timeout = {} ms", o.flush_ms);
     }
-
     let (sig_cid, _) = l.open_channel(proto::AVDTP_PSM, 0x40)?;
     l.sig_dcid = sig_cid;
     println!("AVDTP signalling channel open");
-    let d = l.avdtp(sig_cid, 1, proto::AVDTP_DISCOVER, &[])?;
-    let seid = d
-        .chunks(2)
-        .find(|e| e.len() == 2 && (e[0] & 2) == 0 && (e[1] >> 4) == 0 && (e[1] >> 3) & 1 == 1)
-        .map(|e| e[0] >> 2)
-        .ok_or_else(|| anyhow!("no free audio sink endpoint: {:02x?}", d))?;
-    println!("sink SEID {seid}");
-    let caps = l.avdtp(sig_cid, 2, proto::AVDTP_GET_CAPABILITIES, &[seid << 2])?;
-    let sc = parse_sbc_caps(&caps).ok_or_else(|| anyhow!("sink has no SBC: {:02x?}", caps))?;
-    println!("sink SBC caps: {sc:02x?}; all capabilities: {caps:02x?}");
-
-    let mut cfgp = proto::set_sbc_configuration(seid, 1, &o.cfg);
-    // AVDTP 1.3 Delay Reporting: if the sink offers it, enable it so it tells us its playout buffer depth.
-    if caps_has(&caps, 0x08) {
-        cfgp.extend_from_slice(&[0x08, 0x00]);
-    }
-    // Capability sanity: refuse configs the sink did not advertise.
-    let (freq, chm, blk, sb) = (cfgp[8] & 0xF0, cfgp[8] & 0x0F, cfgp[9] & 0xF0, cfgp[9] & 0x0C);
-    if sc[0] & freq == 0 || sc[0] & chm == 0 || sc[1] & blk == 0 || sc[1] & sb == 0 {
-        bail!("sink does not support requested SBC config; caps {sc:02x?}");
-    }
-    let bp = o.cfg.bitpool.clamp(sc[2], sc[3]);
-    if bp != o.cfg.bitpool {
-        bail!("bitpool {} outside sink range {}..={}", o.cfg.bitpool, sc[2], sc[3]);
-    }
-    l.avdtp(sig_cid, 3, proto::AVDTP_SET_CONFIGURATION, &cfgp)?;
-    l.avdtp(sig_cid, 4, proto::AVDTP_OPEN, &[seid << 2])?;
-    let (media_cid, mtu) = l.open_channel(proto::AVDTP_PSM, 0x41)?;
-    println!("media channel open (remote mtu {mtu})");
-    // Everything that can block happens BEFORE Start: sinks expect media immediately after it.
-    if let Err(e) = l.avrcp_set_volume(0x30) {
-        println!("  [AVRCP] volume not set: {e}");
-    }
-    l.avdtp(sig_cid, 5, proto::AVDTP_START, &[seid << 2])?;
-    Ok((sig_cid, seid, media_cid))
+    let seps = discover_seps(l, sig_cid)?;
+    let sep = pick_sep(&seps, o.codec)?.clone();
+    println!("using {:?} endpoint SEID {}", o.codec, sep.seid);
+    let media_cid = start_endpoint(l, sig_cid, &sep, o, true)?;
+    Ok((sig_cid, sep.seid, media_cid))
 }
 
+/// Switch a live stream to the other codec: Suspend, Close, drop the media channel, then configure the endpoint
+/// that speaks `o.codec`. Returns (seid, media cid).
+pub fn switch_codec(l: &mut Link, sig_cid: u16, old_seid: u8, old_media: u16, o: &StreamOpts) -> Result<(u8, u16)> {
+    let t = l.next_txn();
+    l.avdtp(sig_cid, t, proto::AVDTP_SUSPEND, &[old_seid << 2])?;
+    let t = l.next_txn();
+    l.avdtp(sig_cid, t, proto::AVDTP_CLOSE, &[old_seid << 2])?;
+    l.close_channel(old_media, 0x41)?;
+    let seps = discover_seps(l, sig_cid)?;
+    let sep = pick_sep(&seps, o.codec)?.clone();
+    let media = start_endpoint(l, sig_cid, &sep, o, false)?;
+    Ok((sep.seid, media))
+}
 /// A2DP bring-up + paced test tone.
 pub fn stream_tone(l: &mut Link, o: &StreamOpts) -> Result<()> {
     let (sig_cid, seid, media_cid) = open_stream(l, o)?;

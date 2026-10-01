@@ -1,6 +1,8 @@
 //! airlow: low-latency user-mode Bluetooth audio stack.
 
 mod a2dp;
+#[allow(dead_code)]
+mod aac;
 mod hci;
 mod latency;
 mod live;
@@ -232,6 +234,12 @@ const DEFAULT_LIVE_FRAMES_PER_PACKET: usize = 2;
 fn tone_opts(first: usize) -> a2dp::StreamOpts {
     let arg = |i: usize, d: f32| std::env::args().nth(first + i - 2).and_then(|s| s.parse().ok()).unwrap_or(d);
     a2dp::StreamOpts {
+        codec: if std::env::var("AIRLOW_CODEC").map(|v| v.eq_ignore_ascii_case("aac")).unwrap_or(false) {
+            a2dp::Codec::Aac
+        } else {
+            a2dp::Codec::Sbc
+        },
+        aac_bitrate: std::env::var("AIRLOW_AAC_KBPS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(160) * 1000,
         cfg: sbc::Config {
             rate: sbc::Rate::Hz48000,
             mode: sbc::Mode::JointStereo,
