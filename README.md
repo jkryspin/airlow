@@ -49,6 +49,28 @@ set AIRLOW_SWEEP=codec && airlow pair live        # one session: SBC, AAC, SBC, 
 ```
 The Windows encoder's delay comes from AAC-LC's 1024-sample blocks plus a block of lookahead (the transform windows overlap) and some internal buffering. The AirPods advertise only AAC-LC over A2DP (object types 0xC0), so lower-delay variants such as AAC-ELD are not available; a different LC encoder might save 20-25 ms at most.
 
+## Roadmap: further latency options (researched, not built)
+Where the delay is: roughly 15 ms is ours (Windows' 10 ms capture period, packetising, USB, radio) and most of the rest is
+the AirPods' own playback buffer, which does not respond to how we send audio (tested) and has no documented control: a
+search of the LibrePods/ntpods AirPods protocol code finds nothing latency-related, MagicPods' "Game Mode" is documented
+only for counterfeit Airoha-chip AirPods, and Apple's own macOS Game Mode works on the *source* side (dropping queued audio).
+
+* **#5, low-latency WASAPI capture (IAudioClient3 shared mode): ruled out on this machine.** Loopback capture sees audio at the
+  engine period of the endpoint it taps. `airlow audiocaps` lists every output's shared-mode period range; on the test PC all
+  five (Realtek speakers, USB speakers, monitor audio, digital out, Steam Streaming Speakers) are fixed at 480 frames = 10 ms
+  (minimum = maximum = default), so a shorter capture period is simply not offered. It would help on a machine whose audio
+  driver advertises smaller periods.
+* **#4, a virtual audio device (kernel driver) with a short engine period: the only way past that 10 ms.** A virtual render
+  endpoint can advertise e.g. 128-frame (2.7 ms) periods, which removes most of the capture quantisation and the loopback
+  hop: an estimated saving of about 5-10 ms. Cost and risk: it needs the Windows Driver Kit, a signed driver (test-signing
+  mode and a reboot for development; Secure Boot must allow it), and an ACX/WaveRT audio driver (the ntpods project already
+  does this with Microsoft's ACX `AudioCodec` sample, which is the natural starting point). Worth it only if every
+  millisecond counts: the gain is small next to the AirPods' own buffer.
+* **HFP/SCO (the phone-call profile)** has far smaller buffers (an Apple developer measured about 9 ms reported output latency vs
+  163 ms for A2DP, ~30 ms better in practice), but it is mono 16 kHz, so no stereo positioning, and needs RFCOMM/HFP call
+  setup plus isochronous USB audio, which this controller may route outside USB.
+* **Probe the AirPods' private AACP channel** (L2CAP PSM 0x1001, handshake and "set feature flags" packet known from LibrePods)
+  for an undocumented latency capability. No one has found one; it needs a latency meter to evaluate.
 ## Testing
 A hardware-free simulation suite (73 tests) covers the whole stack against a simulated controller and a strict,
 AirPods-like sink; see [docs/TESTING.md](docs/TESTING.md).

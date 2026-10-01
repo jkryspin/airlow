@@ -8,6 +8,8 @@ mod latency;
 mod live;
 #[allow(dead_code)]
 mod live_aac;
+#[allow(dead_code)]
+mod lowlat;
 mod proto;
 mod sbc;
 #[allow(dead_code)]
@@ -297,6 +299,9 @@ fn main() -> Result<()> {
     }
     if std::env::args().nth(1).as_deref() == Some("mictest") {
         return latency::mic_selftest(std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(8));
+    }
+    if std::env::args().nth(1).as_deref() == Some("audiocaps") {
+        return lowlat::probe();
     }
     if std::env::args().nth(1).as_deref() == Some("captest") {
         return live::capture_selftest(std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(3));
