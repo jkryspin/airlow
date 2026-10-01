@@ -1544,13 +1544,17 @@ pub fn sdp_validate(p: &[u8], txn: [u8; 2], expect_record: bool) -> std::result:
 /// simulated controller and sink instead of a radio. Play a pure tone in Windows while it runs; the sink's
 /// decoded audio is compared with an ideal sine to expose capture glitches and encoding damage.
 pub fn simlive(secs: u32, tone_hz: f64) -> Result<()> {
-    use crate::a2dp::{Link, StreamOpts, open_stream};
+    use crate::a2dp::{Link, StreamOpts};
     let (mut h, sim) = spawn(SimConfig::default());
     let kf = std::env::temp_dir().join("airlow_simlive_key.txt");
     let hd = crate::pair(&mut h, &kf)?;
     let mut l = Link::new(&mut h, hd)?;
     let o = StreamOpts {
-        codec: crate::a2dp::Codec::Sbc,
+        codec: if std::env::var("AIRLOW_CODEC").map(|v| v.eq_ignore_ascii_case("aac")).unwrap_or(false) {
+            crate::a2dp::Codec::Aac
+        } else {
+            crate::a2dp::Codec::Sbc
+        },
         aac_bitrate: 160_000,
         cfg: sbc::Config {
             rate: crate::live::loopback_rate()?,
@@ -1564,10 +1568,9 @@ pub fn simlive(secs: u32, tone_hz: f64) -> Result<()> {
         flush_ms: 40.0,
         seconds: secs,
     };
-    let (sig, seid, media) = open_stream(&mut l, &o)?;
-    let q: crate::live::Q = Arc::new(Mutex::new(VecDeque::new()));
-    let _cap = crate::live::start_capture(q.clone())?;
-    let stats = crate::live::live_loop(&mut l, &o, &q, sig, seid, media)?;
+    // The production path (capture and AAC encoder before Start, codec chosen by AIRLOW_CODEC).
+    crate::live::stream_live(&mut l, &o)?;
+    let stats = crate::live::LiveStats::default();
     l.pump(Duration::from_millis(50));
     let r = sim.report();
     println!("\n== simlive result ==");
@@ -2457,5 +2460,58 @@ mod tests {
         assert!(r.configured.is_some() && r.configured_aac.is_some(), "both codecs must have been configured at some point");
         assert!(!r.paused_by_sink, "sink paused: {:?}", r.pause_info);
         assert_eq!(r.seq_backwards, 0, "a codec switch is a new stream: no stale sequence numbers");
+    }
+
+    #[test]
+    fn codec_sweep_alternates_sbc_and_aac_and_marks_each_phase_audibly() {
+        let (mut h, sim, hd, _k) = paired(SimConfig::default(), "sweep");
+        let mut l = Link::new(&mut h, hd).unwrap();
+        let q: live::Q = Arc::new(Mutex::new(VecDeque::new()));
+        let qf = q.clone();
+        let feeder = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let (mut phase, mut n) = (0f32, 0u64);
+            while t0.elapsed() < Duration::from_millis(9600) {
+                let due = t0 + Duration::from_millis(10 * (n + 1));
+                while Instant::now() < due {
+                    std::thread::sleep(Duration::from_micros(300));
+                }
+                let mut g = qf.lock().unwrap();
+                for _ in 0..480 {
+                    let v = ((phase * std::f32::consts::TAU).sin() * 9000.0) as i16;
+                    phase = (phase + 440.0 / 48000.0).fract();
+                    g.push_back(v);
+                    g.push_back(v);
+                }
+                n += 1;
+            }
+        });
+        let mut o = opts(1, 2);
+        o.cfg.blocks = 16;
+        crate::live_aac::codec_sweep_q(&mut l, &o, &q, 2).unwrap(); // 4 phases of 2 s: room for every marker
+        feeder.join().unwrap();
+        l.pump(Duration::from_millis(50));
+        let r = sim.report();
+        assert!(r.protocol_errors.is_empty(), "{:?}", r.protocol_errors);
+        assert!(!r.paused_by_sink, "sink paused: {:?}", r.pause_info);
+        assert!(r.frames_decoded > 100 && r.aac_frames > 60, "SBC frames {}, AAC frames {}", r.frames_decoded, r.aac_frames);
+        // Gap markers: 1 + 2 + 3 quarter-second silences must be visible in what the sink decoded
+        // (a silent run of at least ~150 ms in the middle of a loud tone).
+        let win = 480usize; // 10 ms
+        let silent: Vec<bool> = r.pcm.chunks(win).map(|c| c.iter().map(|v| v.unsigned_abs() as u32).max().unwrap_or(0) < 400).collect();
+        let (mut runs, mut cur) = (0, 0);
+        for (i, &s) in silent.iter().enumerate() {
+            if s {
+                cur += 1;
+            }
+            if (!s || i + 1 == silent.len()) && cur > 0 {
+                if cur >= 15 && i > 20 && i + 20 < silent.len() {
+                    runs += 1;
+                }
+                cur = 0;
+            }
+        }
+        println!("silent runs >=150 ms inside the tone: {runs} (expected 6 markers)");
+        assert!(runs >= 5, "expected 6 audible gap markers (1+2+3), found {runs}");
     }
 }

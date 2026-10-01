@@ -56,12 +56,28 @@ fn push<T: Copy>(q: &Q, d: &[T], ch: usize, conv: impl Fn(T) -> i16) {
 }
 
 pub fn stream_live(l: &mut Link, o: &StreamOpts) -> Result<()> {
-    let (sig_cid, seid, media_cid) = open_stream(l, o)?;
+    // AIRLOW_SWEEP=codec: one session that alternates SBC and AAC so the two can be compared by ear.
+    if std::env::var("AIRLOW_SWEEP").map(|v| v == "codec").unwrap_or(false) {
+        return crate::live_aac::codec_sweep(l, o);
+    }
+    // Everything slow happens BEFORE Start: the AAC encoder (first-time Media Foundation setup) and the capture
+    // stream. After Start the sink expects media immediately, or it gives up and sends AVRCP PAUSE.
+    let enc = if o.codec == crate::a2dp::Codec::Aac { Some(crate::live_aac::make_encoder(o)?) } else { None };
     let q: Q = Arc::new(Mutex::new(VecDeque::new()));
     let _cap = start_capture(q.clone())?;
-    let s = live_loop(l, o, &q, sig_cid, seid, media_cid)?;
+    let (sig_cid, seid, media_cid) = open_stream(l, o)?;
+    let s = match enc {
+        Some(enc) => crate::live_aac::live_loop_aac(l, o, &q, sig_cid, seid, media_cid, enc)?,
+        None => live_loop(l, o, &q, sig_cid, seid, media_cid)?,
+    };
     println!("  total: sent {} pkts, silence {}, dropped(backlog) {}", s.sent, s.silent, s.dropped);
     Ok(())
+}
+
+/// Discard audio that piled up while the stream was being set up. Trimming it to the 100 ms backlog limit instead
+/// would leave ~100 ms of stale audio that then sits in the sink's buffer as permanent extra lag.
+pub fn discard_stale(q: &Q) {
+    q.lock().unwrap().clear();
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -129,6 +145,7 @@ pub fn live_loop_ex(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8,
         o.flush_ms
     );
 
+    discard_stale(q);
     let end = Instant::now() + Duration::from_secs(ex.secs.unwrap_or(o.seconds as u64));
     let (mut seq, mut ts) = (0u16, 0u32);
     let mut pcm = vec![0u8; codesize];

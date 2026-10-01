@@ -1,4 +1,4 @@
-﻿# Testing
+# Testing
 
 airlow can be exercised end to end **without Bluetooth hardware**. `src/sim.rs` implements the same
 `Backend` trait as the USB transport and simulates:
@@ -13,7 +13,7 @@ airlow can be exercised end to end **without Bluetooth hardware**. `src/sim.rs` 
 The sink is deliberately strict: any protocol error is recorded and fails the test.
 
 ```
-cargo test --release              # ~5 s, 32 tests
+cargo test --release              # ~10 s, 73 tests
 cargo test --release -- --nocapture --test-threads=1   # see measured numbers
 airlow captest [seconds]          # no Bluetooth: checks WASAPI loopback capture on this PC
 ```
@@ -33,3 +33,6 @@ historical bugs were re-introduced one at a time and each was caught by at least
 * Real radio conditions, USB timing on a given machine, and the AirPods' own playback buffer.
 * End-to-end latency. The "pipeline latency" printed by the live tests covers only our software
   (capture buffer to packet on the wire); it excludes USB, the radio and the sink's buffer.
+
+## AAC
+The AAC path is tested with the real Windows AAC encoder and decoder against the simulated sink: LATM packing (bit layout and round trip), AVDTP endpoint selection (the sim offers SBC, AAC and a vendor endpoint), configuration validation, decoded audio quality, idle keep-alive, 44.1 kHz, live codec switching and the SBC/AAC sweep with its audible gap markers. Mutation-tested like the rest.

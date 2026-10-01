@@ -38,6 +38,17 @@ The pairing key is stored in `%APPDATA%\airlow\keys.txt`.
 * The controller completes only ~300-360 ACL packets/s regardless of size, so packets are sized adaptively. A sink fed
   slower than real time starves and outputs nothing.
 
+## Optional AAC mode
+SBC is the default. AirPods are reported to use a smaller playback buffer for AAC than for SBC, so there is an
+optional AAC mode (Windows' built-in AAC-LC encoder through Media Foundation; no third-party codec). It costs about
+**70 ms of fixed encoder delay** on our side (measured), so it only wins if the AirPods' AAC buffer is more than that
+much smaller. Whether it does is exactly what the A/B is for:
+```
+set AIRLOW_CODEC=aac && airlow pair live          # AAC (AIRLOW_AAC_KBPS=96|128|160|192, default 160)
+set AIRLOW_SWEEP=codec && airlow pair live        # one session: SBC, AAC, SBC, AAC (15 s each) with audible gap markers
+```
+If AAC helps, the follow-up is a lower-delay encoder (AAC-ELD is ~15 ms).
+
 ## Testing
 A hardware-free simulation suite (53 tests) covers the whole stack against a simulated controller and a strict,
 AirPods-like sink; see [docs/TESTING.md](docs/TESTING.md).

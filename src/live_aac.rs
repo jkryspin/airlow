@@ -49,6 +49,7 @@ pub fn live_loop_aac_ex(
         o.flush_ms
     );
 
+    crate::live::discard_stale(q);
     let end = Instant::now() + Duration::from_secs(ex.secs.unwrap_or(o.seconds as u64));
     let (mut seq, mut ts) = (0u16, 0u32);
     let mut last_data = Instant::now();
@@ -146,4 +147,52 @@ pub fn live_loop_aac_ex(
     }
     stats.max_queue_ms = maxq_total.max(maxq) as f64 / 2.0 / hz * 1000.0;
     Ok(stats)
+}
+
+/// `AIRLOW_SWEEP=codec`: one session alternating SBC and AAC (15 s each: SBC, AAC, SBC, AAC) with audible gap
+/// markers (none, 1, 2, 3 short silences at the start of each phase) so the codecs can be compared by ear.
+pub fn codec_sweep(l: &mut Link, base: &StreamOpts) -> Result<()> {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    let q: Q = Arc::new(Mutex::new(VecDeque::new()));
+    let _cap = crate::live::start_capture(q.clone())?; // capture first: nothing slow after Start
+    codec_sweep_q(l, base, &q, 15)
+}
+
+/// The sweep with an injectable audio queue and phase length (real capture in production, a tone in tests).
+pub fn codec_sweep_q(l: &mut Link, base: &StreamOpts, q: &Q, phase_secs: u64) -> Result<()> {
+    use crate::a2dp::{self, Codec};
+    use crate::live;
+
+    let sbc_opts = StreamOpts { codec: Codec::Sbc, cfg: base.cfg, ..*base };
+    let aac_opts = StreamOpts { codec: Codec::Aac, cfg: base.cfg, ..*base };
+    let (sig, mut seid, mut media) = a2dp::open_stream(l, &sbc_opts)?;
+    let phases = [Codec::Sbc, Codec::Aac, Codec::Sbc, Codec::Aac];
+    println!("CODEC SWEEP: 4 phases of {phase_secs} s: SBC, AAC, SBC, AAC. Gap markers at the start: none, 1, 2, 3.");
+    for (i, codec) in phases.iter().enumerate() {
+        let last = i == phases.len() - 1;
+        let mut enc = None;
+        if i > 0 {
+            let o = if *codec == Codec::Aac { &aac_opts } else { &sbc_opts };
+            // The AAC encoder is built right after the Suspend and before anything restarts.
+            let (s2, m2) = a2dp::switch_codec(l, sig, seid, media, o, || {
+                if *codec == Codec::Aac {
+                    enc = Some(make_encoder(&aac_opts)?);
+                }
+                Ok(())
+            })?;
+            seid = s2;
+            media = m2;
+        } else if *codec == Codec::Aac {
+            enc = Some(make_encoder(&aac_opts)?);
+        }
+        println!("== PHASE {}: {}", i + 1, if *codec == Codec::Aac { "AAC" } else { "SBC" });
+        let ex = LoopEx { secs: Some(phase_secs), start_gaps: i, suspend_at_end: last };
+        if *codec == Codec::Aac {
+            live_loop_aac_ex(l, &aac_opts, q, sig, seid, media, enc.take().expect("encoder built"), ex)?;
+        } else {
+            live::live_loop_ex(l, &sbc_opts, q, sig, seid, media, ex)?;
+        }
+    }
+    Ok(())
 }
