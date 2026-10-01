@@ -50,11 +50,11 @@ set AIRLOW_SWEEP=codec && airlow pair live        # one session: SBC, AAC, SBC, 
 If AAC helps, the follow-up is a lower-delay encoder (AAC-ELD is ~15 ms).
 
 ## Testing
-A hardware-free simulation suite (53 tests) covers the whole stack against a simulated controller and a strict,
+A hardware-free simulation suite (73 tests) covers the whole stack against a simulated controller and a strict,
 AirPods-like sink; see [docs/TESTING.md](docs/TESTING.md).
 
 ## Limits
-* SBC only (AirPods also offer AAC, which no free low-delay encoder covers here).
+* SBC by default; AAC-LC is optional and adds ~70 ms of encoder delay (see above). No AAC-ELD or other low-delay codec yet.
 * The AirPods' own playout buffer is outside our control and bounds the total latency.
 * Audio comes from WASAPI loopback; a virtual audio endpoint would remove Windows' mixer delay.
 * Only tested with one controller. Controllers that need vendor firmware download are not handled.
