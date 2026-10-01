@@ -42,7 +42,7 @@ The pairing key is stored in `%APPDATA%\airlow\keys.txt`.
 SBC is the default. AirPods are reported to use a smaller playback buffer for AAC than for SBC, so there is an
 optional AAC mode (Windows' built-in AAC-LC encoder through Media Foundation; no third-party codec). It costs about
 **70 ms of fixed encoder delay** on our side (measured), so it only wins if the AirPods' AAC buffer is more than that
-much smaller. Whether it does is exactly what the A/B is for:
+much smaller. **Measured by ear on AirPods Pro 2 (SBC/AAC/SBC/AAC click test against speakers): SBC was faster, so SBC is the default and AAC is kept as an option.** To try it yourself:
 ```
 set AIRLOW_CODEC=aac && airlow pair live          # AAC (AIRLOW_AAC_KBPS=96|128|160|192, default 160)
 set AIRLOW_SWEEP=codec && airlow pair live        # one session: SBC, AAC, SBC, AAC (15 s each) with audible gap markers
