@@ -27,6 +27,23 @@ Options for `live`/`tone`: `[blocks=16] [frames_per_packet] [flush_ms=40] [bitpo
 `AIRLOW_USB=vvvv:pppp` selects another WinUSB-bound controller. `AIRLOW_TRACE=1` prints raw HCI/ACL traffic.
 The pairing key is stored in `%APPDATA%\airlow\keys.txt`.
 
+## Everyday use: the tray app (no terminal)
+`airlow-tray.exe` runs in the background with a tray icon and no console window.
+1. One-time: bind your USB Bluetooth controller to WinUSB ([docs/setup.md](docs/setup.md)).
+2. Run `airlow-tray.exe`. In the tray menu choose **Pair AirPods...** and put the AirPods in pairing mode (case open, hold the
+   back button until the light flashes white). Tick **Start with Windows** to launch it at login.
+3. In Windows *Sound settings* pick an output device that exists only to be captured, by default
+   **Speakers (Steam Streaming Speakers)** (installed with Steam; no kernel driver of ours is involved, so anti-cheat and
+   Memory Integrity are unaffected). Any virtual output works: set `capture_device` in the settings file.
+4. From then on, opening the case or putting the AirPods in connects them automatically (airlow accepts their reconnect and
+   pages them if they do not) and whatever Windows plays on that output is streamed to them.
+
+Icon colour: grey = needs action, amber = waiting/connecting, green = streaming, red = error (hover or open the menu for text).
+Settings (`%APPDATA%\airlow\config.txt`, created on first use): `capture_device`, `volume` (the AirPods' initial volume, 0-127;
+Windows' own volume slider does **not** reach them because loopback is captured before it), `codec` (`sbc` or `aac`).
+The log is `%APPDATA%\airlow\airlow.log`. Tray latency is the same as `airlow live`: the Bluetooth-side tuning applies, and
+capture still happens at the endpoint's 10 ms engine period.
+
 ## Things we learned the hard way (all verified on hardware)
 * **Attach the Wi-Fi/Bluetooth antenna.** On a combined Wi-Fi/Bluetooth board module the antenna carries Bluetooth too;
   without it ~78% of packets were lost.
@@ -72,7 +89,7 @@ only for counterfeit Airoha-chip AirPods, and Apple's own macOS Game Mode works 
 * **Probe the AirPods' private AACP channel** (L2CAP PSM 0x1001, handshake and "set feature flags" packet known from LibrePods)
   for an undocumented latency capability. No one has found one; it needs a latency meter to evaluate.
 ## Testing
-A hardware-free simulation suite (73 tests) covers the whole stack against a simulated controller and a strict,
+A hardware-free simulation suite (85 tests) covers the whole stack against a simulated controller and a strict,
 AirPods-like sink; see [docs/TESTING.md](docs/TESTING.md).
 
 ## Limits

@@ -11,13 +11,42 @@ use std::time::{Duration, Instant};
 /// Interleaved s16 stereo samples, produced by the capture callback (or a test).
 pub type Q = Arc<Mutex<VecDeque<i16>>>;
 
+/// Index of the output device to capture: the first whose name contains `want` (case-insensitive), else the default.
+pub fn choose_device(names: &[String], want: Option<&str>, default: Option<usize>) -> Option<usize> {
+    if let Some(w) = want.map(str::trim).filter(|w| !w.is_empty()) {
+        let w = w.to_lowercase();
+        if let Some(i) = names.iter().position(|n| n.to_lowercase().contains(&w)) {
+            return Some(i);
+        }
+    }
+    default.filter(|&d| d < names.len())
+}
+
+/// Output device to capture: `AIRLOW_CAPTURE` or the tray's configured name, falling back to the default output.
+fn capture_device() -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    let devs: Vec<cpal::Device> = host.output_devices()?.collect();
+    let names: Vec<String> = devs.iter().map(|d| d.description().map(|d| d.name().to_string()).unwrap_or_default()).collect();
+    let default_name = host.default_output_device().and_then(|d| d.description().ok().map(|d| d.name().to_string()));
+    let default = default_name.and_then(|n| names.iter().position(|x| *x == n));
+    let want = CAPTURE_NAME.lock().unwrap().clone().or_else(|| std::env::var("AIRLOW_CAPTURE").ok());
+    let i = choose_device(&names, want.as_deref(), default).ok_or_else(|| anyhow!("no output device to capture"))?;
+    Ok(devs.into_iter().nth(i).unwrap())
+}
+
+/// Preferred capture device name (set by the tray from its config); None means AIRLOW_CAPTURE or the default.
+pub static CAPTURE_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set to ask a running live loop to finish (Suspend and return) as soon as possible.
+pub static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn loopback_rate() -> Result<sbc::Rate> {
-    let dev = cpal::default_host().default_output_device().ok_or_else(|| anyhow!("no default output device"))?;
+    let dev = capture_device()?;
     let c = dev.default_output_config()?;
     match c.sample_rate() {
         48000 => Ok(sbc::Rate::Hz48000),
         44100 => Ok(sbc::Rate::Hz44100),
-        r => bail!("default output device runs at {r} Hz; set it to 44100 or 48000 in Windows sound settings"),
+        r => bail!("capture device runs at {r} Hz; set it to 44100 or 48000 in Windows sound settings"),
     }
 }
 
@@ -25,7 +54,7 @@ pub fn loopback_rate() -> Result<sbc::Rate> {
 pub static CAPTURE_XRUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn start_capture(q: Q) -> Result<cpal::Stream> {
-    let dev = cpal::default_host().default_output_device().ok_or_else(|| anyhow!("no default output device"))?;
+    let dev = capture_device()?;
     let c = dev.default_output_config()?;
     let ch = c.channels() as usize;
     let cfg: cpal::StreamConfig = c.clone().into();
@@ -177,7 +206,7 @@ pub fn live_loop_ex(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8,
     // Audible phase markers: brief muted windows (1 gap = phase 2, 2 gaps = phase 3); timing is preserved.
     let mut mute: Vec<(Instant, Instant)> = gap_markers(ex.start_gaps);
     let (mut c_prev, mut f_prev) = (l.completed, l.flushed);
-    while Instant::now() < end {
+    while Instant::now() < end && !STOP.load(std::sync::atomic::Ordering::Relaxed) {
         if cfg_sweep {
             let p = ((t_begin.elapsed().as_secs() / 18) as usize).min(cfg_phases.len() - 1);
             if p != phase {
@@ -416,4 +445,31 @@ pub fn capture_selftest(secs: u64) -> Result<()> {
         if peak == 0 { "  <- SILENCE: nothing is playing in Windows" } else { "" }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::choose_device;
+
+    fn names() -> Vec<String> {
+        ["Speakers (Realtek(R) Audio)", "Speakers (Steam Streaming Speakers)", "DELL P2415Q"].map(String::from).to_vec()
+    }
+
+    #[test]
+    fn picks_configured_device_case_insensitively() {
+        assert_eq!(choose_device(&names(), Some("steam streaming"), Some(0)), Some(1));
+    }
+
+    #[test]
+    fn falls_back_to_default_when_missing_or_unset() {
+        assert_eq!(choose_device(&names(), Some("nonexistent"), Some(2)), Some(2));
+        assert_eq!(choose_device(&names(), None, Some(0)), Some(0));
+        assert_eq!(choose_device(&names(), Some("  "), Some(0)), Some(0));
+    }
+
+    #[test]
+    fn nothing_to_capture_is_none() {
+        assert_eq!(choose_device(&[], Some("x"), None), None);
+        assert_eq!(choose_device(&names(), None, Some(9)), None);
+    }
 }

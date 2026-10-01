@@ -62,6 +62,11 @@ pub struct SimConfig {
     pub reject_reconfigure: bool,
     /// Offer only the SBC endpoint (a sink without AAC).
     pub sbc_only: bool,
+    /// Once page scan is enabled the sink "opens the case" and pages us: a Connection_Request event arrives
+    /// and the link only comes up if we answer it with Accept_Connection_Request.
+    pub request_on_scan: bool,
+    /// The sink hangs up this many ms after AVDTP Start (goes back in the case).
+    pub drop_after_start_ms: Option<u64>,
 }
 
 impl Default for SimConfig {
@@ -86,6 +91,8 @@ impl Default for SimConfig {
             sink_prefill_ms: 120,
             reject_reconfigure: true,
             sbc_only: false,
+            request_on_scan: false,
+            drop_after_start_ms: None,
         }
     }
 }
@@ -119,6 +126,8 @@ pub struct Report {
     pub flushed: u64,
     pub link_key_issued: Option<[u8; 16]>,
     pub encrypted: bool,
+    /// Accept_Connection_Request was correctly answered for an incoming link.
+    pub accepted_request: bool,
     pub pb_violations: u64,
     pub l2cap_config_rsp_scid_ok: bool,
     /// Times the sink's playout buffer ran dry (audible as dropouts or silence).
@@ -412,7 +421,25 @@ impl Sim {
                     self.connected = true;
                 }
             }
-            0x0C01 | 0x0C56 | 0x0C45 | 0x0C24 | 0x0C1A | 0x080F => self.cc(op, &[0]),
+            0x0C1A => {
+                self.cc(op, &[0]);
+                if self.cfg.request_on_scan && p.first().map(|v| v & 2 != 0).unwrap_or(false) && !self.connected {
+                    self.cfg.request_on_scan = false;
+                    self.at(40, Out::Evt([vec![0x04, 10], SINK_ADDR.to_vec(), vec![0x14, 0x04, 0x20, 1]].concat()));
+                }
+            }
+            0x0409 => {
+                if p.len() != 7 || p[..6] != SINK_ADDR || p[6] != 0 {
+                    self.err(format!("Accept_Connection_Request must name the requester and take the central role, got {p:02x?}"));
+                    self.cs(op, 0x02);
+                } else {
+                    self.cs(op, 0);
+                    self.connected = true;
+                    self.rep.lock().unwrap().accepted_request = true;
+                    self.at(10, Out::Evt(vec![0x03, 11, 0, 0x32, 0, 0x56, 0x34, 0x12, 0xEF, 0xCD, 0xAB, 1, 0]));
+                }
+            }
+            0x0C01 | 0x0C56 | 0x0C45 | 0x0C24 | 0x080F => self.cc(op, &[0]),
             0x1001 => self.cc(op, &[0, 13, 0x04, 0x11, 13, 70, 0, 0x06, 0x26]),
             0x1009 => {
                 let mut r = vec![0];
@@ -1188,6 +1215,9 @@ impl Sim {
                 if self.avdtp == AvdtpState::Open && seid_ok(prm) && media_open {
                     self.avdtp = AvdtpState::Streaming;
                     self.rep.lock().unwrap().start_at = Some(Instant::now());
+                    if let Some(ms) = self.cfg.drop_after_start_ms {
+                        self.at(ms, Out::Evt(vec![0x05, 4, 0, 0x32, 0, 0x13]));
+                    }
                     // A new Start begins a fresh stream: sequence, timestamp and playout state restart, and the
                     // "media is late" clock runs from this Start, not from the previous stream's last packet.
                     self.rep.lock().unwrap().last_media_at = None;
@@ -2513,5 +2543,105 @@ mod tests {
         }
         println!("silent runs >=150 ms inside the tone: {runs} (expected 6 markers)");
         assert!(runs >= 5, "expected 6 audible gap markers (1+2+3), found {runs}");
+    }
+
+    // ----- the tray's background session manager -----
+
+    use crate::daemon::{self, Cmd, Config, Status, Timing};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    /// Run the daemon against a simulated sink until `done(statuses)` holds, then quit it.
+    fn run_daemon(
+        cfg: SimConfig,
+        tag: &str,
+        key: Option<[u8; 16]>,
+        script: impl Fn(&mpsc::Sender<Cmd>, &[Status]) -> bool,
+    ) -> (Vec<Status>, Report) {
+        let (mut h, sim) = spawn(cfg);
+        let keyfile = kf(tag);
+        let _ = std::fs::remove_file(&keyfile);
+        if let Some(k) = key {
+            crate::save_key(&keyfile, &SINK_ADDR, &k);
+        }
+        let statuses = Arc::new(Mutex::new(Vec::<Status>::new()));
+        let (tx, rx) = mpsc::channel();
+        let st = statuses.clone();
+        let worker = std::thread::spawn(move || {
+            let t = Timing { page_every: Duration::from_millis(300), retry_after: Duration::from_millis(200) };
+            let c = Config { capture_device: String::new(), ..Config::default() };
+            let report = move |s: Status| {
+                let mut g = st.lock().unwrap();
+                if g.last() != Some(&s) {
+                    g.push(s);
+                }
+            };
+            daemon::serve(&mut h, &keyfile, &rx, &report, &t, &c).unwrap();
+        });
+        let end = Instant::now() + Duration::from_secs(40);
+        loop {
+            let snapshot = statuses.lock().unwrap().clone();
+            if script(&tx, &snapshot) || Instant::now() > end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = tx.send(Cmd::Quit);
+        worker.join().unwrap();
+        let s = statuses.lock().unwrap().clone();
+        (s, sim.report())
+    }
+
+    fn streamed_then_waiting_again(s: &[Status]) -> bool {
+        s.iter().position(|x| *x == Status::Streaming).map(|i| s[i..].contains(&Status::Waiting)).unwrap_or(false)
+    }
+
+    #[test]
+    fn daemon_accepts_the_airpods_reconnect_streams_and_goes_back_to_waiting() {
+        crate::realtime_tuning();
+        let key = [9u8; 16];
+        let cfg = SimConfig { request_on_scan: true, bonded_key: Some(key), drop_after_start_ms: Some(1500), ..Default::default() };
+        let (s, r) = run_daemon(cfg, "daemon_incoming", Some(key), |_, s| streamed_then_waiting_again(s));
+        assert_eq!(s[..3], [Status::Waiting, Status::Connecting, Status::Streaming], "statuses: {s:?}");
+        assert!(streamed_then_waiting_again(&s), "after the AirPods leave the daemon must wait again: {s:?}");
+        assert!(r.protocol_errors.is_empty(), "protocol errors: {:?}", r.protocol_errors);
+        assert!(r.encrypted && r.first_media_at.is_some());
+        assert!(r.accepted_request, "the incoming Connection_Request must be accepted, not left to our own page");
+    }
+
+    #[test]
+    fn daemon_pages_the_airpods_when_they_do_not_connect_themselves() {
+        crate::realtime_tuning();
+        let key = [4u8; 16];
+        let cfg = SimConfig { bonded_key: Some(key), drop_after_start_ms: Some(1000), ..Default::default() };
+        let (s, r) = run_daemon(cfg, "daemon_page", Some(key), |_, s| s.contains(&Status::Streaming));
+        assert!(s.contains(&Status::Streaming), "statuses: {s:?}");
+        assert!(r.protocol_errors.is_empty(), "protocol errors: {:?}", r.protocol_errors);
+    }
+
+    #[test]
+    fn daemon_without_a_pairing_asks_for_one_and_pairs_on_request() {
+        crate::realtime_tuning();
+        let cfg = SimConfig { drop_after_start_ms: Some(1000), ..Default::default() };
+        let (s, r) = run_daemon(cfg, "daemon_pair", None, |tx, s| {
+            if s == [Status::NeedsPairing] {
+                tx.send(Cmd::Pair).unwrap();
+            }
+            s.contains(&Status::Streaming)
+        });
+        assert_eq!(s[..2], [Status::NeedsPairing, Status::Pairing], "statuses: {s:?}");
+        assert!(s.contains(&Status::Waiting) && s.contains(&Status::Streaming), "statuses: {s:?}");
+        assert!(r.link_key_issued.is_some(), "pairing must have bonded");
+        assert!(r.protocol_errors.is_empty(), "protocol errors: {:?}", r.protocol_errors);
+    }
+
+    #[test]
+    fn daemon_survives_a_controller_error_and_keeps_listening() {
+        crate::realtime_tuning();
+        // Wrong key on the sink side: authentication fails, the daemon reports it and retries instead of dying.
+        let cfg = SimConfig { bonded_key: Some([1u8; 16]), ..Default::default() };
+        let (s, _) =
+            run_daemon(cfg, "daemon_badkey", Some([2u8; 16]), |_, s| s.iter().filter(|x| matches!(x, Status::Error(_))).count() >= 1);
+        assert!(s.iter().any(|x| matches!(x, Status::Error(_))), "statuses: {s:?}");
     }
 }

@@ -1,4 +1,4 @@
-//! Live path for the optional AAC mode: drain captured PCM, feed the Windows AAC encoder, and send each encoded
+﻿//! Live path for the optional AAC mode: drain captured PCM, feed the Windows AAC encoder, and send each encoded
 //! frame as its own LATM/RTP packet. Mirrors the SBC loop's behaviour (credit-aware, keep-alive silence on a
 //! real-time clock, audible gap markers) so the two can be A/B tested by ear.
 
@@ -56,7 +56,7 @@ pub fn live_loop_aac_ex(
     let mut silence_clock = Instant::now();
     let mut was_silent = false;
     let max_backlog = (hz * 0.100) as usize * 2;
-    let mut mute = gap_markers(ex.start_gaps);
+    let mute = gap_markers(ex.start_gaps);
     let mut stats = LiveStats { max_frames_per_packet: 1, ..Default::default() };
     let (mut maxq, mut maxq_total) = (0usize, 0usize);
     let mut report = Instant::now() + Duration::from_secs(5);

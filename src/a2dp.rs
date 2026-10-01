@@ -557,6 +557,9 @@ impl<'a> Link<'a> {
     }
 }
 
+/// Initial AVRCP absolute volume (0..=127) sent to the sink before Start.
+pub static AVRCP_VOLUME: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0x30);
+
 /// Connect (with stored link key), authenticate, encrypt. Returns ACL handle.
 pub fn connect(h: &mut Hci, addr: &Addr, key: &[u8; 16]) -> Result<u16> {
     // Adopt a link the AirPods opened themselves (they auto-reconnect to the last host).
@@ -761,7 +764,10 @@ fn start_endpoint(l: &mut Link, sig_cid: u16, sep: &Sep, o: &StreamOpts, with_vo
     let (media_cid, mtu) = l.open_channel(proto::AVDTP_PSM, 0x41)?;
     println!("media channel open (remote mtu {mtu})");
     if with_volume {
-        if let Err(e) = l.avrcp_set_volume(0x30) {
+        // Windows' volume slider does not reach the AirPods (loopback is pre-volume): set their volume here.
+        let env = std::env::var("AIRLOW_VOLUME").ok().and_then(|v| v.trim().parse::<u8>().ok());
+        let vol = env.unwrap_or_else(|| AVRCP_VOLUME.load(std::sync::atomic::Ordering::Relaxed)).min(0x7F);
+        if let Err(e) = l.avrcp_set_volume(vol) {
             println!("  [AVRCP] volume not set: {e}");
         }
     }
@@ -891,7 +897,7 @@ pub fn stream_tone(l: &mut Link, o: &StreamOpts) -> Result<()> {
     Ok(())
 }
 
-fn finish_link(h: &mut Hci, addr: &Addr, key: &[u8; 16], hd: u16) -> Result<u16> {
+pub fn finish_link(h: &mut Hci, addr: &Addr, key: &[u8; 16], hd: u16) -> Result<u16> {
     h.cmd(0x0411, &hd.to_le_bytes())?;
     let end = Instant::now() + Duration::from_secs(15);
     while Instant::now() < end {
