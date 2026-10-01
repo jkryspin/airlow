@@ -800,9 +800,21 @@ pub fn open_stream(l: &mut Link, o: &StreamOpts) -> Result<(u16, u8, u16)> {
 
 /// Switch a live stream to the other codec: Suspend, Close, drop the media channel, then configure the endpoint
 /// that speaks `o.codec`. Returns (seid, media cid).
-pub fn switch_codec(l: &mut Link, sig_cid: u16, old_seid: u8, old_media: u16, o: &StreamOpts) -> Result<(u8, u16)> {
+///
+/// `prepare` runs right after the Suspend and before anything is started again: build the new codec's encoder
+/// there. Slow first-time setup must never happen while a stream is Streaming with no media flowing (the sink
+/// would pause) or after Start (dead air).
+pub fn switch_codec(
+    l: &mut Link,
+    sig_cid: u16,
+    old_seid: u8,
+    old_media: u16,
+    o: &StreamOpts,
+    prepare: impl FnOnce() -> Result<()>,
+) -> Result<(u8, u16)> {
     let t = l.next_txn();
     l.avdtp(sig_cid, t, proto::AVDTP_SUSPEND, &[old_seid << 2])?;
+    prepare()?;
     let t = l.next_txn();
     l.avdtp(sig_cid, t, proto::AVDTP_CLOSE, &[old_seid << 2])?;
     l.close_channel(old_media, 0x41)?;

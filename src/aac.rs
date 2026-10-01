@@ -259,7 +259,20 @@ impl AacEncoder {
         }
     }
 
+    /// A warmed-up encoder: created, initialised and fed 120 ms of silence (output discarded) so that after the
+    /// stream starts, the first real audio produces frames immediately. Build it BEFORE AVDTP Start: first-time
+    /// Media Foundation setup takes long enough to look like dead air, which makes AirPods send AVRCP PAUSE.
+    pub fn new_primed(rate: u32, channels: u32, bitrate: u32) -> Result<Self> {
+        let mut e = Self::new(rate, channels, bitrate)?;
+        let silence = vec![0i16; (rate as usize / 1000 * 10) * channels as usize]; // 10 ms
+        for _ in 0..12 {
+            e.encode(&silence)?;
+        }
+        Ok(e)
+    }
+
     /// Feed interleaved PCM (any length); returns the AAC frames that became ready.
+
     pub fn encode(&mut self, pcm: &[i16]) -> Result<Vec<Vec<u8>>> {
         debug_assert_eq!(pcm.len() % self.channels, 0);
         let bytes: Vec<u8> = pcm.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -280,6 +293,10 @@ pub struct AacDecoder {
     rate: u32,
     pos: i64,
 }
+
+// SAFETY: the Windows AAC decoder MFT is not tied to a thread. The simulator creates it on its own thread and
+// only ever uses it there; `Send` just lets the enclosing simulator struct be moved into that thread.
+unsafe impl Send for AacDecoder {}
 
 impl AacDecoder {
     pub fn new(rate: u32, channels: u32) -> Result<Self> {

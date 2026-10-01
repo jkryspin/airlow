@@ -84,6 +84,37 @@ const MAX_FRAMES_PER_PACKET: usize = 8;
 /// [`MAX_FRAMES_PER_PACKET`]) into it. A sink that receives audio slower than real time starves and
 /// outputs nothing, so keeping up is more important than the last millisecond of packetisation delay.
 pub fn live_loop(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8, media_cid: u16) -> Result<LiveStats> {
+    live_loop_ex(l, o, q, sig_cid, seid, media_cid, LoopEx::default())
+}
+
+/// Extras for A/B sessions: how long to run, audible start markers (muted gaps), and whether to Suspend at the end.
+#[derive(Clone, Copy)]
+pub struct LoopEx {
+    pub secs: Option<u64>,
+    pub start_gaps: usize,
+    pub suspend_at_end: bool,
+}
+
+impl Default for LoopEx {
+    fn default() -> Self {
+        Self { secs: None, start_gaps: 0, suspend_at_end: true }
+    }
+}
+
+/// Mute windows: `gaps` quarter-second silences half a second apart, starting now. Timing is preserved (the
+/// muted audio is replaced by zeros of the same duration, never removed), so a marker adds no lag.
+pub fn gap_markers(gaps: usize) -> Vec<(Instant, Instant)> {
+    let now = Instant::now();
+    (0..gaps)
+        .map(|k| {
+            let a = now + Duration::from_millis(500 * k as u64);
+            (a, a + Duration::from_millis(250))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn live_loop_ex(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8, media_cid: u16, ex: LoopEx) -> Result<LiveStats> {
     let mut media_cid = media_cid;
     let mut enc = sbc::Encoder::new(o.cfg);
     let mut spf = enc.samples_per_frame();
@@ -98,7 +129,7 @@ pub fn live_loop(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8, me
         o.flush_ms
     );
 
-    let end = Instant::now() + Duration::from_secs(o.seconds as u64);
+    let end = Instant::now() + Duration::from_secs(ex.secs.unwrap_or(o.seconds as u64));
     let (mut seq, mut ts) = (0u16, 0u32);
     let mut pcm = vec![0u8; codesize];
     let mut fr = vec![0u8; 1024];
@@ -127,7 +158,7 @@ pub fn live_loop(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8, me
     let mut pace_next = Instant::now();
     let (t_begin, mut phase) = (Instant::now(), usize::MAX);
     // Audible phase markers: brief muted windows (1 gap = phase 2, 2 gaps = phase 3); timing is preserved.
-    let mut mute: Vec<(Instant, Instant)> = Vec::new();
+    let mut mute: Vec<(Instant, Instant)> = gap_markers(ex.start_gaps);
     let (mut c_prev, mut f_prev) = (l.completed, l.flushed);
     while Instant::now() < end {
         if cfg_sweep {
@@ -320,8 +351,10 @@ pub fn live_loop(l: &mut Link, o: &StreamOpts, q: &Q, sig_cid: u16, seid: u8, me
             report = Instant::now() + Duration::from_secs(5);
         }
     }
-    let _ = l.avdtp(sig_cid, 6, proto::AVDTP_SUSPEND, &[seid << 2]);
-    println!("done");
+    if ex.suspend_at_end {
+        let _ = l.avdtp(sig_cid, 6, proto::AVDTP_SUSPEND, &[seid << 2]);
+        println!("done");
+    }
     stats.max_queue_ms = maxq_total as f64 / 2.0 / hz * 1000.0;
     stats.max_frames_per_packet = max_fpp;
     Ok(stats)

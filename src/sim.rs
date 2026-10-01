@@ -60,6 +60,8 @@ pub struct SimConfig {
     pub sink_prefill_ms: u64,
     /// Reject AVDTP Reconfigure (optional in the spec). The real AirPods do, with error 0x81.
     pub reject_reconfigure: bool,
+    /// Offer only the SBC endpoint (a sink without AAC).
+    pub sbc_only: bool,
 }
 
 impl Default for SimConfig {
@@ -83,6 +85,7 @@ impl Default for SimConfig {
             max_pkts_per_sec: 0,
             sink_prefill_ms: 120,
             reject_reconfigure: true,
+            sbc_only: false,
         }
     }
 }
@@ -126,6 +129,11 @@ pub struct Report {
     /// Milliseconds after Start at which each underrun happened, and the largest gap between media packets.
     pub underrun_at_ms: Vec<u64>,
     pub max_arrival_gap_ms: f64,
+    /// AAC: the configured codec information element and how many AAC frames were decoded.
+    pub configured_aac: Option<[u8; 6]>,
+    pub aac_frames: u64,
+    /// Why/when the sink paused the stream (diagnostics for failing tests).
+    pub pause_info: Option<String>,
 }
 
 enum Msg {
@@ -246,6 +254,17 @@ struct Sim {
     delay_reporting: bool,
     play_start: Option<Instant>,
     rx_samples: u64,
+    /// The endpoint the host configured (None until Set_Configuration is accepted) and its codec.
+    active_seid: Option<u8>,
+    codec: SimCodec,
+    aac_dec: Option<crate::aac::AacDecoder>,
+    aac_rate: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SimCodec {
+    Sbc,
+    Aac,
 }
 
 fn le16(b: &[u8]) -> u16 {
@@ -285,6 +304,10 @@ impl Sim {
             delay_reporting: false,
             play_start: None,
             rx_samples: 0,
+            active_seid: None,
+            codec: SimCodec::Sbc,
+            aac_dec: None,
+            aac_rate: 48000,
         }
     }
 
@@ -989,16 +1012,30 @@ impl Sim {
             // Response to a sink-initiated command (delay report): fine.
             return;
         }
+        if crate::hci::trace() {
+            eprintln!("[sim {:?}] AVDTP signal {sig:#04x} txn {txn} in state {:?}", Instant::now(), self.avdtp);
+        }
         let prm = &p[2..];
-        let seid_ok = |b: &[u8]| !b.is_empty() && (b[0] >> 2) == 1;
+        let active = self.active_seid;
+        let seid_ok = move |b: &[u8]| !b.is_empty() && Some(b[0] >> 2) == active;
+        let known = |b: &[u8]| !b.is_empty() && matches!(b[0] >> 2, 1..=3);
         match sig {
+            0x01 if self.cfg.sbc_only => self.avdtp_reply(txn, 2, sig, &[0x04, 0x08]),
             0x01 => self.avdtp_reply(txn, 2, sig, &[0x04, 0x08, 0x08, 0x08, 0x0C, 0x08]),
             0x02 | 0x0C => {
-                if seid_ok(prm) {
-                    self.avdtp_reply(txn, 2, sig, &[0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x3F, 0xFF, 0x02, 0x35, 0x08, 0x00]);
-                } else {
+                if !known(prm) {
                     self.avdtp_reply(txn, 3, sig, &[0x12]);
+                    return;
                 }
+                let caps: Vec<u8> = match prm[0] >> 2 {
+                    // SEID 1: SBC (as captured from the real AirPods)
+                    1 => vec![0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x3F, 0xFF, 0x02, 0x35, 0x08, 0x00],
+                    // SEID 2: AAC, several object-type bits set like the AirPods do, 44.1/48 kHz, mono+stereo, VBR, 320 kbit/s
+                    2 => vec![0x01, 0x00, 0x07, 0x08, 0x00, 0x02, 0xC0, 0x01, 0x8C, 0x84, 0xE2, 0x00],
+                    // SEID 3: a vendor codec the host must skip
+                    _ => vec![0x01, 0x00, 0x07, 0x08, 0x00, 0xFF, 0x4C, 0x00, 0x00, 0x00, 0x01, 0x00],
+                };
+                self.avdtp_reply(txn, 2, sig, &caps);
             }
             0x03 => {
                 // ACP seid, INT seid, then capability items.
@@ -1006,13 +1043,14 @@ impl Sim {
                     self.avdtp_reply(txn, 3, sig, &[0x07, 0x1F]);
                     return;
                 }
-                if prm.len() < 4 || !seid_ok(prm) || self.avdtp != AvdtpState::Idle {
+                let seid = prm.first().map(|b| b >> 2).unwrap_or(0);
+                if prm.len() < 4 || !matches!(seid, 1 | 2) || self.avdtp != AvdtpState::Idle {
                     self.err(format!("Set_Configuration in state {:?} / bad seid: {prm:02x?}", self.avdtp));
                     self.avdtp_reply(txn, 3, sig, &[0x00, 0x31]);
                     return;
                 }
                 let caps = &prm[2..];
-                let mut sbc_cfg = None;
+                let (mut sbc_cfg, mut aac_cfg) = (None, None);
                 let mut transport = false;
                 let mut i = 0;
                 while i + 2 <= caps.len() {
@@ -1030,7 +1068,41 @@ impl Sim {
                     if cat == 0x07 && len == 6 && d[0] == 0x00 && d[1] == 0x00 {
                         sbc_cfg = Some([d[2], d[3], d[4], d[5]]);
                     }
+                    if cat == 0x07 && len == 8 && d[0] == 0x00 && d[1] == 0x02 {
+                        aac_cfg = Some([d[2], d[3], d[4], d[5], d[6], d[7]]);
+                    }
                     i += 2 + len;
+                }
+                if seid == 2 {
+                    // AAC: exactly one object type, one frequency, one channel mode, within the advertised capabilities.
+                    let valid = transport
+                        && aac_cfg
+                            .map(|c| {
+                                let br = ((c[3] & 0x7F) as u32) << 16 | (c[4] as u32) << 8 | c[5] as u32;
+                                c[0].count_ones() == 1
+                                    && c[0] & 0xC0 != 0
+                                    && c[1].count_ones() + (c[2] & 0xF0).count_ones() == 1
+                                    && (c[1] & 0x01 != 0 || c[2] & 0x80 != 0)
+                                    && (c[2] & 0x0C).count_ones() == 1
+                                    && br <= 320_000
+                            })
+                            .unwrap_or(false);
+                    if let (true, Some(c)) = (valid, aac_cfg) {
+                        self.aac_rate = if c[2] & 0x80 != 0 { 48000 } else { 44100 };
+                        match crate::aac::AacDecoder::new(self.aac_rate, 2) {
+                            Ok(dec) => self.aac_dec = Some(dec),
+                            Err(e) => self.err(format!("sim cannot create an AAC decoder: {e}")),
+                        }
+                        self.rep.lock().unwrap().configured_aac = Some(c);
+                        self.codec = SimCodec::Aac;
+                        self.active_seid = Some(2);
+                        self.avdtp = AvdtpState::Configured;
+                        self.avdtp_reply(txn, 2, sig, &[]);
+                    } else {
+                        self.err(format!("invalid AAC configuration {prm:02x?}"));
+                        self.avdtp_reply(txn, 3, sig, &[0x07, 0xC1]);
+                    }
+                    return;
                 }
                 let valid = transport
                     && sbc_cfg
@@ -1047,6 +1119,8 @@ impl Sim {
                         .unwrap_or(false);
                 if valid {
                     self.rep.lock().unwrap().configured = sbc_cfg;
+                    self.codec = SimCodec::Sbc;
+                    self.active_seid = Some(1);
                     self.avdtp = AvdtpState::Configured;
                     self.avdtp_reply(txn, 2, sig, &[]);
                 } else {
@@ -1114,6 +1188,14 @@ impl Sim {
                 if self.avdtp == AvdtpState::Open && seid_ok(prm) && media_open {
                     self.avdtp = AvdtpState::Streaming;
                     self.rep.lock().unwrap().start_at = Some(Instant::now());
+                    // A new Start begins a fresh stream: sequence, timestamp and playout state restart, and the
+                    // "media is late" clock runs from this Start, not from the previous stream's last packet.
+                    self.rep.lock().unwrap().last_media_at = None;
+                    self.last_seq = None;
+                    self.last_ts = None;
+                    self.last_samples = 0;
+                    self.play_start = None;
+                    self.rx_samples = 0;
                     self.avdtp_reply(txn, 2, sig, &[]);
                 } else {
                     self.err(format!("Start in state {:?} (media channel open: {media_open})", self.avdtp));
@@ -1127,6 +1209,8 @@ impl Sim {
             }
             0x08 | 0x0A => {
                 self.avdtp = AvdtpState::Idle;
+                self.active_seid = None;
+                self.aac_dec = None;
                 self.avdtp_reply(txn, 2, sig, &[]);
             }
             _ => {
@@ -1148,43 +1232,26 @@ impl Sim {
             self.rep.lock().unwrap().media_dropped_after_pause += 1;
             return;
         }
-        if p.len() < 13 || p[0] != 0x80 || (p[1] & 0x7F) != 96 {
-            self.err(format!("bad RTP header {:02x?}", &p[..p.len().min(14)]));
+        let decoded = match self.codec {
+            SimCodec::Sbc => self.decode_sbc_media(p),
+            SimCodec::Aac => self.decode_aac_media(p),
+        };
+        let Some((seq, ts, samples, nframes, pcm_out)) = decoded else {
             return;
-        }
-        let (seq, ts) = (u16::from_be_bytes([p[2], p[3]]), u32::from_be_bytes([p[4], p[5], p[6], p[7]]));
-        let hdr = p[12];
-        if hdr & 0xF0 != 0 {
-            self.err(format!("SBC payload header has fragmentation bits set: {hdr:#04x}"));
-            return;
-        }
-        let nframes = hdr & 0x0F;
-        let mut off = 13;
-        let mut samples = 0u32;
-        let mut pcm_out = Vec::new();
-        let mut buf = vec![0u8; 2048];
-        for _ in 0..nframes {
-            if let Err(e) = self.check_frame_header(&p[off..]) {
-                self.err(e);
-                return;
-            }
-            let Some((used, wrote)) = self.dec.decode_frame(&p[off..], &mut buf) else {
-                self.err("undecodable SBC frame");
-                return;
-            };
-            for s in buf[..wrote].chunks(4) {
-                pcm_out.push(i16::from_le_bytes([s[0], s[1]]));
-            }
-            samples += (wrote / 4) as u32;
-            off += used;
-        }
-        if off != p.len() {
-            self.err(format!("{} trailing bytes after {nframes} SBC frames", p.len() - off));
-        }
+        };
         // Playout buffer model: playback starts `sink_prefill_ms` after the first packet and consumes
         // audio in real time. Audio arriving slower than that drains the buffer: an underrun.
         {
-            let rate = if self.rep.lock().unwrap().configured.map(|c| c[0] & 0x20 != 0).unwrap_or(false) { 44100.0 } else { 48000.0 };
+            let rate = match self.codec {
+                SimCodec::Aac => self.aac_rate as f64,
+                SimCodec::Sbc => {
+                    if self.rep.lock().unwrap().configured.map(|c| c[0] & 0x20 != 0).unwrap_or(false) {
+                        44100.0
+                    } else {
+                        48000.0
+                    }
+                }
+            };
             let prefill = Duration::from_millis(self.cfg.sink_prefill_ms);
             let mut r = self.rep.lock().unwrap();
             match self.play_start {
@@ -1232,6 +1299,78 @@ impl Sim {
         r.last_media_at = Some(now);
         r.arrivals.push((seq, ts, now, nframes));
         r.pcm.extend(pcm_out);
+    }
+
+    /// Parse and decode an SBC media packet. Returns (seq, timestamp, samples per channel, frames, left-channel PCM).
+    fn decode_sbc_media(&mut self, p: &[u8]) -> Option<(u16, u32, u32, u8, Vec<i16>)> {
+        if p.len() < 13 || p[0] != 0x80 || (p[1] & 0x7F) != 96 {
+            self.err(format!("bad RTP header {:02x?}", &p[..p.len().min(14)]));
+            return None;
+        }
+        let (seq, ts) = (u16::from_be_bytes([p[2], p[3]]), u32::from_be_bytes([p[4], p[5], p[6], p[7]]));
+        let hdr = p[12];
+        if hdr & 0xF0 != 0 {
+            self.err(format!("SBC payload header has fragmentation bits set: {hdr:#04x}"));
+            return None;
+        }
+        let nframes = hdr & 0x0F;
+        let mut off = 13;
+        let mut samples = 0u32;
+        let mut pcm_out = Vec::new();
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..nframes {
+            if let Err(e) = self.check_frame_header(&p[off..]) {
+                self.err(e);
+                return None;
+            }
+            let Some((used, wrote)) = self.dec.decode_frame(&p[off..], &mut buf) else {
+                self.err("undecodable SBC frame");
+                return None;
+            };
+            for s in buf[..wrote].chunks(4) {
+                pcm_out.push(i16::from_le_bytes([s[0], s[1]]));
+            }
+            samples += (wrote / 4) as u32;
+            off += used;
+        }
+        if off != p.len() {
+            self.err(format!("{} trailing bytes after {nframes} SBC frames", p.len() - off));
+        }
+        Some((seq, ts, samples, nframes, pcm_out))
+    }
+
+    /// Parse and decode an AAC media packet: RTP (marker set) + one LATM AudioMuxElement carrying one AAC frame.
+    fn decode_aac_media(&mut self, p: &[u8]) -> Option<(u16, u32, u32, u8, Vec<i16>)> {
+        if p.len() < 14 || p[0] != 0x80 || p[1] != 0xE0 {
+            self.err(format!("bad AAC RTP header (needs V=2, M=1, PT=96): {:02x?}", &p[..p.len().min(14)]));
+            return None;
+        }
+        let (seq, ts) = (u16::from_be_bytes([p[2], p[3]]), u32::from_be_bytes([p[4], p[5], p[6], p[7]]));
+        let (ri, ch, raw) = match crate::aac::latm_demux(&p[12..]) {
+            Ok(x) => x,
+            Err(e) => {
+                self.err(format!("undecodable LATM payload: {e}"));
+                return None;
+            }
+        };
+        if crate::aac::index_rate(ri) != Some(self.aac_rate) || ch != 2 {
+            self.err(format!("LATM stream config (rate index {ri}, {ch} ch) disagrees with the negotiated {} Hz stereo", self.aac_rate));
+            return None;
+        }
+        let Some(dec) = self.aac_dec.as_mut() else {
+            self.err("AAC media but no decoder (configuration failed?)");
+            return None;
+        };
+        let pcm = match dec.decode(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                self.err(format!("undecodable AAC frame: {e}"));
+                return None;
+            }
+        };
+        self.rep.lock().unwrap().aac_frames += 1;
+        let left: Vec<i16> = pcm.chunks(2).map(|c| c[0]).collect();
+        Some((seq, ts, crate::aac::FRAME_SAMPLES as u32, 1, left))
     }
 
     /// A strict sink rejects frames whose SBC header disagrees with the negotiated configuration.
@@ -1282,6 +1421,18 @@ impl Sim {
             (reference.map(|t| now.duration_since(t) > self.cfg.media_deadline).unwrap_or(false), r.paused_by_sink)
         };
         if late && !already {
+            {
+                let mut r = self.rep.lock().unwrap();
+                let now = Instant::now();
+                r.pause_info = Some(format!(
+                    "codec {:?}, state {:?}, {:?} ms since last media, {:?} ms since Start, media packets so far {}",
+                    self.codec,
+                    self.avdtp,
+                    r.last_media_at.map(|t| now.duration_since(t).as_millis()),
+                    r.start_at.map(|t| now.duration_since(t).as_millis()),
+                    r.media_pkts
+                ));
+            }
             self.rep.lock().unwrap().paused_by_sink = true;
             // What the real AirPods did: ask the source to pause.
             if self.chans.get(&R_AVCTP).map(|c| c.cfg_in && c.cfg_out).unwrap_or(false) {
@@ -1952,9 +2103,23 @@ mod tests {
 
     /// Drive `live_loop` with a continuous tone fed in `chunk_ms` bursts; returns (report, stats, samples fed).
     fn run_live_tone(cfg: SimConfig, fpp: usize, chunk_ms: u64, secs: f32, tag: &str) -> (Report, live::LiveStats, usize) {
+        run_live_tone_codec(cfg, a2dp::Codec::Sbc, fpp, chunk_ms, secs, tag)
+    }
+
+    fn run_live_tone_codec(
+        cfg: SimConfig,
+        codec: a2dp::Codec,
+        fpp: usize,
+        chunk_ms: u64,
+        secs: f32,
+        tag: &str,
+    ) -> (Report, live::LiveStats, usize) {
         let (mut h, sim, hd, _k) = paired(cfg, tag);
         let mut l = Link::new(&mut h, hd).unwrap();
-        let o = opts(secs.ceil() as u32 + 1, fpp);
+        let mut o = opts(secs.ceil() as u32 + 1, fpp);
+        o.codec = codec;
+        // The AAC encoder must exist (and be warm) BEFORE the stream starts, or the sink sees dead air after Start.
+        let enc = (codec == a2dp::Codec::Aac).then(|| crate::live_aac::make_encoder(&o).unwrap());
         let (sig, seid, media) = a2dp::open_stream(&mut l, &o).unwrap();
         let q: live::Q = Arc::new(Mutex::new(VecDeque::new()));
         let qf = q.clone();
@@ -1981,7 +2146,10 @@ mod tests {
                 n += 1;
             }
         });
-        let stats = live::live_loop(&mut l, &o, &q, sig, seid, media).unwrap();
+        let stats = match codec {
+            a2dp::Codec::Sbc => live::live_loop(&mut l, &o, &q, sig, seid, media).unwrap(),
+            a2dp::Codec::Aac => crate::live_aac::live_loop_aac(&mut l, &o, &q, sig, seid, media, enc.unwrap()).unwrap(),
+        };
         feeder.join().unwrap();
         l.pump(Duration::from_millis(50));
         (sim.report(), stats, fed.load(std::sync::atomic::Ordering::Relaxed))
@@ -2159,5 +2327,135 @@ mod tests {
         let n1 = (0.6f64 / (192.0 / 48000.0)) as usize * 192;
         assert!((amp_at(&r.pcm[3000..n1 - 3000], 440.0, 48000.0) - 6000.0).abs() < 700.0);
         assert!((amp_at(&r.pcm[n1 + 3000..r.pcm.len() - 3000], 660.0, 48000.0) - 6000.0).abs() < 700.0);
+    }
+
+    // ----- optional AAC mode: the real Windows AAC encoder/decoder against the strict simulated sink -----
+
+    #[test]
+    fn aac_stream_plays_a_tone_through_the_real_windows_codec() {
+        let (r, s, fed) = run_live_tone_codec(SimConfig::default(), a2dp::Codec::Aac, 2, 10, 2.4, "aac1");
+        println!("AAC live: {s:?}, aac frames {}, decoded {} samples (fed {fed}), underruns {}", r.aac_frames, r.pcm.len(), r.underruns);
+        assert!(r.protocol_errors.is_empty(), "{:?}", r.protocol_errors);
+        assert!(r.configured_aac.is_some(), "an AAC configuration must have been negotiated");
+        assert!(r.configured.is_none(), "the SBC endpoint must not have been configured");
+        assert!(r.aac_frames > 90, "only {} AAC frames reached the sink", r.aac_frames);
+        assert_eq!(r.underruns, 0, "sink starved");
+        assert_eq!(r.seq_gaps + r.seq_backwards + r.ts_errors, 0);
+        assert!(!r.paused_by_sink);
+        let mid = &r.pcm[20_000..(fed - 40_000).min(r.pcm.len())];
+        let (snr, amp) = sine_snr(mid, 440.0, 48000.0);
+        println!("AAC tone: amplitude {amp:.0}, SNR {snr:.1} dB");
+        assert!((amp - 6000.0).abs() < 600.0 && snr > 25.0, "AAC audio damaged: amp {amp:.0}, SNR {snr:.1} dB");
+    }
+
+    #[test]
+    fn aac_idle_silence_keeps_the_sink_alive() {
+        let (mut h, sim, hd, _k) = paired(SimConfig::default(), "aacidle");
+        let mut l = Link::new(&mut h, hd).unwrap();
+        let mut o = opts(2, 2);
+        o.codec = a2dp::Codec::Aac;
+        let enc = crate::live_aac::make_encoder(&o).unwrap();
+        let (sig, seid, media) = a2dp::open_stream(&mut l, &o).unwrap();
+        let q: live::Q = Arc::new(Mutex::new(VecDeque::new()));
+        crate::live_aac::live_loop_aac(&mut l, &o, &q, sig, seid, media, enc).unwrap();
+        l.pump(Duration::from_millis(50));
+        let r = sim.report();
+        assert!(!r.paused_by_sink, "silence keep-alive failed for AAC");
+        assert_eq!(r.underruns, 0);
+        assert!(r.aac_frames > 60, "only {} frames in 2 s of idle", r.aac_frames);
+        assert!(r.protocol_errors.is_empty(), "{:?}", r.protocol_errors);
+    }
+
+    #[test]
+    fn aac_negotiates_44100_hz_too() {
+        let (mut h, sim, hd, _k) = paired(SimConfig::default(), "aac441");
+        let mut l = Link::new(&mut h, hd).unwrap();
+        let mut o = opts(1, 2);
+        o.codec = a2dp::Codec::Aac;
+        o.cfg.rate = sbc::Rate::Hz44100;
+        let enc = crate::live_aac::make_encoder(&o).unwrap();
+        let (sig, seid, media) = a2dp::open_stream(&mut l, &o).unwrap();
+        let q: live::Q = Arc::new(Mutex::new(VecDeque::new()));
+        crate::live_aac::live_loop_aac(&mut l, &o, &q, sig, seid, media, enc).unwrap();
+        l.pump(Duration::from_millis(50));
+        let r = sim.report();
+        assert!(r.protocol_errors.is_empty(), "{:?}", r.protocol_errors);
+        let c = r.configured_aac.expect("AAC configured");
+        assert_eq!((c[1], c[2] & 0xF0), (0x01, 0x00), "44.1 kHz is signalled in byte 1");
+        assert!(r.aac_frames > 20);
+    }
+
+    #[test]
+    fn requesting_aac_from_a_sink_without_it_is_a_clear_error() {
+        let (mut h, _sim, hd, _k) = paired(SimConfig { sbc_only: true, ..Default::default() }, "noaac");
+        let mut l = Link::new(&mut h, hd).unwrap();
+        let mut o = opts(1, 2);
+        o.codec = a2dp::Codec::Aac;
+        let e = a2dp::open_stream(&mut l, &o).unwrap_err().to_string();
+        assert!(e.contains("offers no Aac endpoint") && e.contains("SEID 1"), "{e}");
+    }
+
+    #[test]
+    fn aac_endpoint_discovery_skips_vendor_endpoints_and_picks_the_right_one() {
+        let (mut h, _sim, hd, _k) = paired(SimConfig::default(), "seps");
+        let mut l = Link::new(&mut h, hd).unwrap();
+        let mut o = opts(1, 2);
+        o.codec = a2dp::Codec::Aac;
+        let (_sig, seid, _media) = a2dp::open_stream(&mut l, &o).unwrap();
+        assert_eq!(seid, 2, "the AAC endpoint, not the SBC (1) or the vendor one (3)");
+    }
+
+    #[test]
+    fn codec_can_be_switched_live_sbc_to_aac_and_back() {
+        let (mut h, sim, hd, _k) = paired(SimConfig::default(), "switch");
+        let mut l = Link::new(&mut h, hd).unwrap();
+        let o_sbc = opts(1, 2);
+        let mut o_aac = opts(1, 2);
+        o_aac.codec = a2dp::Codec::Aac;
+        let (sig, seid, media) = a2dp::open_stream(&mut l, &o_sbc).unwrap();
+        let q: live::Q = Arc::new(Mutex::new(VecDeque::new()));
+        let qf = q.clone();
+        let feeder = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let mut phase = 0f32;
+            let mut n = 0u64;
+            while t0.elapsed() < Duration::from_millis(4600) {
+                let due = t0 + Duration::from_millis(10 * (n + 1));
+                while Instant::now() < due {
+                    std::thread::sleep(Duration::from_micros(300));
+                }
+                let mut g = qf.lock().unwrap();
+                for _ in 0..480 {
+                    let v = ((phase * std::f32::consts::TAU).sin() * 6000.0) as i16;
+                    phase = (phase + 440.0 / 48000.0).fract();
+                    g.push_back(v);
+                    g.push_back(v);
+                }
+                n += 1;
+            }
+        });
+        let ex = live::LoopEx { secs: Some(1), start_gaps: 0, suspend_at_end: false };
+        live::live_loop_ex(&mut l, &o_sbc, &q, sig, seid, media, ex).unwrap();
+        let mut enc = None;
+        let (seid2, media2) = a2dp::switch_codec(&mut l, sig, seid, media, &o_aac, || {
+            enc = Some(crate::live_aac::make_encoder(&o_aac)?); // after the Suspend, before anything restarts
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seid2, 2);
+        crate::live_aac::live_loop_aac_ex(&mut l, &o_aac, &q, sig, seid2, media2, enc.take().unwrap(), ex).unwrap();
+        let (seid3, media3) = a2dp::switch_codec(&mut l, sig, seid2, media2, &o_sbc, || Ok(())).unwrap();
+        assert_eq!(seid3, 1);
+        // The final phase Suspends: a stream left Streaming with no media is (rightly) paused by a strict sink.
+        live::live_loop_ex(&mut l, &o_sbc, &q, sig, seid3, media3, live::LoopEx { suspend_at_end: true, ..ex }).unwrap();
+        feeder.join().unwrap();
+        l.pump(Duration::from_millis(50));
+        let r = sim.report();
+        assert!(r.protocol_errors.is_empty(), "{:?}", r.protocol_errors);
+        assert!(r.frames_decoded > 100, "SBC frames: {}", r.frames_decoded);
+        assert!(r.aac_frames > 30, "AAC frames: {}", r.aac_frames);
+        assert!(r.configured.is_some() && r.configured_aac.is_some(), "both codecs must have been configured at some point");
+        assert!(!r.paused_by_sink, "sink paused: {:?}", r.pause_info);
+        assert_eq!(r.seq_backwards, 0, "a codec switch is a new stream: no stale sequence numbers");
     }
 }

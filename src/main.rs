@@ -6,6 +6,8 @@ mod aac;
 mod hci;
 mod latency;
 mod live;
+#[allow(dead_code)]
+mod live_aac;
 mod proto;
 mod sbc;
 #[allow(dead_code)]
